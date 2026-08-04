@@ -1,0 +1,182 @@
+name: Traiter une commune
+
+# Déclenché manuellement depuis l'onglet "Actions" de GitHub (bouton "Run
+# workflow") — aucune planification automatique. Tourne sur les serveurs
+# gratuits de GitHub (Ubuntu), pas sur un PC local, et gratuitement/sans
+# limite puisque CE dépôt (le code) est public — les minutes Actions sont
+# illimitées sur les dépôts publics.
+#
+# Le code et les données sont volontairement séparés dans deux dépôts :
+# ce dépôt-ci (public, juste la logique du programme, rien de sensible)
+# et Mikajy01/walon-map-data (privé, contient la vraie progression et les
+# fichiers Excel vendus aux clients — jamais exposé publiquement). Le
+# jeton d'accès à ce second dépôt est stocké en secret GitHub Actions
+# (DATA_REPO_TOKEN), jamais visible dans le code ni dans les logs.
+on:
+  workflow_dispatch:
+    inputs:
+      commune:
+        description: "Commune à traiter"
+        required: true
+        type: string
+      pays:
+        description: "Pays"
+        required: false
+        default: "Belgique"
+        type: string
+      code_postal:
+        description: "Code(s) postal(aux) à filtrer, séparés par une virgule (vide = tous)"
+        required: false
+        default: ""
+        type: string
+      limit:
+        description: "Nombre max de NOUVELLES parcelles à traiter (vide = tout ce qui reste)"
+        required: false
+        default: "500"
+        type: string
+      rate_limit:
+        description: "Requêtes par seconde vers le Géoportail"
+        required: false
+        default: "5"
+        type: string
+      debug:
+        description: "Journalisation détaillée (DEBUG)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # Un groupe PAR COMMUNE : deux communes différentes tournent en
+  # parallèle sans jamais s'attendre (chacune dans son propre fichier de
+  # cache/logs côté dépôt de données). Seules deux exécutions sur LA MÊME
+  # commune s'attendent l'une l'autre.
+  group: traiter-commune-${{ inputs.commune }}
+  cancel-in-progress: false
+
+jobs:
+  traiter:
+    runs-on: ubuntu-latest
+    # Marge sous la limite de 6h des runners hébergés GitHub. Le débit
+    # réel observé est très inférieur au débit configuré (latence réseau
+    # par requête, pas la limitation de débit elle-même) : une limite de
+    # 500 parcelles peut prendre plusieurs heures selon la commune.
+    timeout-minutes: 340
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Récupérer les données existantes (dépôt privé séparé)
+        run: |
+          set -e
+          git clone --depth 1 "https://x-access-token:${{ secrets.DATA_REPO_TOKEN }}@github.com/Mikajy01/walon-map-data.git" donnees
+          mkdir -p donnees/cache donnees/output donnees/logs
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Lancer le traitement
+        run: |
+          set -e
+          # cache/logs isolés par commune (voir concurrency ci-dessus),
+          # sortie Excel dans le dépôt de données plutôt que dans ce
+          # checkout de code (--output-dir).
+          ARGS=(--commune "${{ inputs.commune }}" --pays "${{ inputs.pays }}"
+                --rate-limit "${{ inputs.rate_limit }}"
+                --template "Entête walonmap (avec colonnes en plus).xlsx"
+                --cache-dir "donnees/cache/${{ inputs.commune }}"
+                --logs-dir "donnees/logs/${{ inputs.commune }}"
+                --output-dir "donnees/output")
+          if [ -n "${{ inputs.limit }}" ]; then
+            ARGS+=(--limit "${{ inputs.limit }}")
+          fi
+          if [ -n "${{ inputs.code_postal }}" ]; then
+            IFS=',' read -ra CODES <<< "${{ inputs.code_postal }}"
+            for code in "${CODES[@]}"; do
+              code_trim="$(echo "$code" | xargs)"
+              if [ -n "$code_trim" ]; then
+                ARGS+=(--code-postal "$code_trim")
+              fi
+            done
+          fi
+          if [ "${{ inputs.debug }}" = "true" ]; then
+            ARGS+=(--debug)
+          fi
+          python main.py "${ARGS[@]}"
+
+      - name: Vider le cache HTTP brut avant de committer
+        if: always()
+        # Le cache HTTP (table `http_cache`, réponses ArcGIS brutes) accélère
+        # UNIQUEMENT l'exécution en cours (évite des requêtes redondantes sur
+        # les mêmes couches/parcelles) ; il n'a aucune valeur une fois
+        # l'exécution terminée, contrairement à `parcelle_resultats` (la
+        # vraie progression, à conserver). Le laisser s'accumuler à chaque
+        # exécution ferait regrossir le fichier indéfiniment (observé en
+        # conditions réelles : 160-240 Mo pour ~1000-1800 parcelles avec le
+        # cache HTTP inclus, contre 1,4-2,4 Mo sans lui) jusqu'à dépasser la
+        # limite de 100 Mo de GitHub. On le vide donc (DELETE + VACUUM, qui
+        # réduit réellement la taille du fichier) juste avant de committer —
+        # la vitesse au sein d'une même exécution n'est pas affectée, seul
+        # ce qui est poussé dans le dépôt de données reste petit.
+        run: |
+          python -c "
+          import sqlite3
+          from pathlib import Path
+          db_path = Path('donnees/cache/${{ inputs.commune }}/http_cache.sqlite3')
+          if not db_path.exists():
+              print('Pas de fichier de cache (le traitement a probablement échoué avant toute écriture) : rien à nettoyer.')
+          else:
+              conn = sqlite3.connect(db_path)
+              table_existe = conn.execute(
+                  \"SELECT 1 FROM sqlite_master WHERE type='table' AND name='http_cache'\"
+              ).fetchone()
+              if table_existe:
+                  conn.execute('DELETE FROM http_cache')
+                  conn.commit()  # VACUUM ne peut pas tourner dans une transaction ouverte
+                  conn.execute('VACUUM')
+                  print('Cache HTTP vidé.')
+              conn.close()
+          "
+
+      - name: Committer et pousser les résultats (dépôt de données)
+        if: always()
+        # `if: always()` : même si le traitement s'est arrêté avant la fin
+        # (timeout, quota, erreur), tout ce qui a été résolu jusque-là est
+        # déjà persisté dans donnees/cache/<commune>/http_cache.sqlite3 —
+        # on le committe quand même pour ne jamais perdre de travail déjà
+        # fait.
+        #
+        # Réessai avec rebase avant de pousser : même avec des fichiers
+        # séparés par commune, deux exécutions peuvent finir à quelques
+        # secondes d'intervalle et vouloir pousser sur un dépôt qui a bougé
+        # entretemps — un simple nouvel essai après rebase suffit puisque
+        # les fichiers touchés ne se recoupent pas.
+        run: |
+          cd donnees
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f "cache/${{ inputs.commune }}/http_cache.sqlite3" \
+                     "logs/${{ inputs.commune }}/" \
+                     "output/${{ inputs.commune }}.xlsx" 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "Rien de nouveau à committer."
+            exit 0
+          fi
+          git commit -m "Traitement automatique : ${{ inputs.commune }} (${{ github.run_id }})"
+          for tentative in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push refusé (tentative $tentative/5), nouvel essai après rebase..."
+            git pull --rebase
+          done
+          echo "Échec du push après 5 tentatives." >&2
+          exit 1

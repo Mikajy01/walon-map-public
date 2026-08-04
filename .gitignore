@@ -1,0 +1,42 @@
+# Environnements virtuels
+.venv/
+.venv_build/
+venv/
+env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Artefacts de build PyInstaller (voir build.bat) — régénérables, jamais versionnés
+build/
+dist/
+*.spec
+
+# Données générées par le programme (jamais versionnées : régénérables)
+cache/*.sqlite3
+logs/*.log
+logs/*.log.*
+output/*.xlsx
+output/*.xls
+
+# Fichiers de verrouillage Excel
+~$*.xlsx
+~$*.xls
+
+# Configuration locale / secrets
+.env
+.licence
+
+# Accès par commune (outils/gerer_licences.py) : mots de passe/sels réels
+# des clients, jamais versionnés — seule la publication manuelle vers
+# l'emplacement public (voir utils/licence.py) est censée les exposer,
+# et uniquement sous forme de hash, jamais en clair.
+outils/autorisations.json
+
+# Éditeurs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
