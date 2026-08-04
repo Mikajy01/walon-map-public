@@ -35,7 +35,7 @@ if sys.stderr is None:
 import customtkinter as ctk
 
 import config
-from main import ResultatTraitement, traiter_commune
+from main import ResultatTraitement, recalculer_cote_position, traiter_commune
 from services.cache_service import CacheService, ProgressStore
 from services.cadastre_service import CadastreService
 from services.excel_service import ExcelService
@@ -194,6 +194,11 @@ class App(ctk.CTk):
             command=self._importer_excel_corrige,
         )
         self.bouton_importer_corrige.pack(side="left", padx=(8, 0))
+        self.bouton_recalculer_cote_position = ctk.CTkButton(
+            action, text="Recalculer côté/position…", height=40,
+            command=self._recalculer_cote_position,
+        )
+        self.bouton_recalculer_cote_position.pack(side="left", padx=(8, 0))
 
         self.label_statut = ctk.CTkLabel(self, text="Prêt.", anchor="w")
         self.label_statut.pack(fill="x", padx=16, pady=(10, 2))
@@ -265,6 +270,8 @@ class App(ctk.CTk):
             self._fin_synchronisation(rapport=message[1], chemin=message[2])
         elif kind == "sync_done_verrouille":
             self._fin_synchronisation(rapport=message[1], chemin=message[2], fichier_verrouille=True)
+        elif kind == "recalcul_done":
+            self._fin_recalcul(n=message[1], chemin=message[2])
         elif kind == "error":
             self._fin_traitement(succes=False, erreur=message[1])
 
@@ -277,7 +284,11 @@ class App(ctk.CTk):
     def _maj_progression(self, phase: str, actuel: int, total: int) -> None:
         ratio = (actuel / total) if total else 0
         self.barre_progression.set(ratio)
-        libelle = "Découverte des adresses" if phase == "découverte" else "Remplissage des colonnes"
+        libelles = {
+            "découverte": "Découverte des adresses",
+            "recalcul_côté_position": "Recalcul côté/position",
+        }
+        libelle = libelles.get(phase, "Remplissage des colonnes")
         self.label_statut.configure(text=f"{libelle}… ({actuel}/{total})")
 
     # -- Validation et lancement ---------------------------------------------
@@ -466,10 +477,83 @@ class App(ctk.CTk):
             logging.getLogger("gui").exception("Échec de l'importation/synchronisation")
             self._message_queue.put(("error", str(exc)))
 
+    # -- Recalcul côté/position (rattrapage pour les parcelles déjà résolues) -
+
+    def _recalculer_cote_position(self) -> None:
+        """Rattrapage à lancer une fois par commune : calcule côté/position
+        (voir utils/geometrie.py) pour les parcelles déjà résolues AVANT
+        l'ajout de ce calcul — voir main.py::recalculer_cote_position. Les
+        parcelles traitées via « Démarrer le traitement » l'ont déjà,
+        inutile de relancer ceci après."""
+        if self._en_cours:
+            return
+        commune = self.entry_commune.get().strip()
+        fichier_entree = self.entry_fichier_entree.get().strip()
+        fichier_sortie = self.entry_fichier_sortie.get().strip()
+        if not commune:
+            messagebox.showerror(APP_TITLE, "Le champ Commune est obligatoire pour le recalcul côté/position.")
+            return
+        if not fichier_entree or not Path(fichier_entree).is_file():
+            messagebox.showerror(
+                APP_TITLE, "Choisissez un fichier Excel gabarit valide (sert à réécrire le fichier de sortie).",
+            )
+            return
+        if not fichier_sortie:
+            messagebox.showerror(APP_TITLE, "Choisissez où enregistrer le fichier de sortie.")
+            return
+        if not self._verifier_licence(commune):
+            return
+
+        self._en_cours = True
+        self.bouton_lancer.configure(state="disabled")
+        self.bouton_importer_corrige.configure(state="disabled")
+        self.bouton_recalculer_cote_position.configure(state="disabled", text="Recalcul en cours…")
+        self.bouton_ouvrir_dossier.configure(state="disabled")
+        self.barre_progression.set(0)
+        self.label_statut.configure(text="Recalcul côté/position en cours…")
+        self.zone_log.configure(state="normal")
+        self.zone_log.delete("1.0", "end")
+        self.zone_log.configure(state="disabled")
+
+        thread = threading.Thread(
+            target=self._executer_recalcul_cote_position,
+            args=(commune, Path(fichier_entree), Path(fichier_sortie), self.slider_vitesse.get()),
+            daemon=True,
+        )
+        thread.start()
+
+    def _executer_recalcul_cote_position(
+        self, commune: str, fichier_entree: Path, fichier_sortie: Path, rate_limit: float,
+    ) -> None:
+        """Tourne dans un thread d'arrière-plan, comme `_executer` : voir
+        main.py::recalculer_cote_position pour la logique elle-même
+        (aucune duplication ici)."""
+        try:
+            cache_service = CacheService(config.CACHE_DIR)
+            progress_store = ProgressStore(config.CACHE_DIR)
+            client = ArcGISRestClient(
+                cache=cache_service, rate_limiter=RateLimiter(rate_limit), timeout=config.HTTP_TIMEOUT_SECONDS,
+            )
+            cadastre_service = CadastreService(client, progress_store)
+            excel_service = ExcelService(fichier_entree)
+
+            def on_progress(phase: str, actuel: int, total: int) -> None:
+                self._message_queue.put(("progress", phase, actuel, total))
+
+            n = recalculer_cote_position(
+                commune, cadastre_service, progress_store, excel_service,
+                output_path=fichier_sortie, on_progress=on_progress,
+            )
+            self._message_queue.put(("recalcul_done", n, fichier_sortie))
+        except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
+            logging.getLogger("gui").exception("Échec du recalcul côté/position")
+            self._message_queue.put(("error", str(exc)))
+
     def _reactiver_boutons(self) -> None:
         self._en_cours = False
         self.bouton_lancer.configure(state="normal", text="Démarrer le traitement")
         self.bouton_importer_corrige.configure(state="normal", text="Importer un Excel corrigé…")
+        self.bouton_recalculer_cote_position.configure(state="normal", text="Recalculer côté/position…")
 
     def _fin_traitement(
         self, succes: bool, resultat: Optional[ResultatTraitement] = None, erreur: Optional[str] = None,
@@ -513,6 +597,19 @@ class App(ctk.CTk):
             self._ajouter_log(texte)
             self.label_statut.configure(text=texte)
             messagebox.showinfo(APP_TITLE, texte)
+
+    def _fin_recalcul(self, n: int, chemin: Path) -> None:
+        self._reactiver_boutons()
+        self.barre_progression.set(1)
+        if n:
+            self._output_path = chemin
+            self.bouton_ouvrir_dossier.configure(state="normal")
+            texte = f"Recalcul terminé — {n} parcelle(s) corrigée(s) (côté/position). Fichier généré : {chemin}"
+        else:
+            texte = "Recalcul terminé — rien à corriger (toutes les parcelles avaient déjà côté/position)."
+        self._ajouter_log(texte)
+        self.label_statut.configure(text=texte)
+        messagebox.showinfo(APP_TITLE, texte)
 
 
 def _erreur_demarrage_fatale(message: str) -> None:

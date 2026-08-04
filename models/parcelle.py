@@ -27,6 +27,14 @@ class Parcelle:
     y: Optional[float] = None
     geometry: Optional[Dict[str, Any]] = None
 
+    # Côté ("G"/"D") et position (mètres depuis le début du tracé) le long
+    # de la rue — voir utils/geometrie.py. Sert au tri de sortie (toutes
+    # les parcelles d'un côté, dans l'ordre où on les croise en marchant,
+    # puis celles de l'autre côté), calculé pareil pour une parcelle avec
+    # ou sans adresse (indépendant du numéro pair/impair).
+    cote: Optional[str] = None
+    position_rue: Optional[float] = None
+
     # Résultats calculés : {lettre_colonne: valeur}
     valeurs: Dict[str, str] = field(default_factory=dict)
 

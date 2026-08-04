@@ -20,6 +20,7 @@ import config
 from models.parcelle import Parcelle
 from services.cache_service import ProgressStore
 from services.geoportail_service import ArcGISRestClient
+from utils.geometrie import cote_et_position, construire_segments
 from utils.logger import get_logger
 
 _logger = get_logger("services.cadastre_service")
@@ -58,6 +59,17 @@ def _point_dans_polygone(x: float, y: float, rings: Sequence[Sequence[Sequence[f
                 dedans = not dedans
             j = i
     return dedans
+
+
+def _centre_polygone(rings: Sequence[Sequence[Sequence[float]]]) -> Optional[Tuple[float, float]]:
+    """Moyenne simple des sommets du premier anneau — pas un vrai centroïde
+    géométrique, mais suffisant pour situer une parcelle par rapport au
+    tracé d'une rue (voir utils/geometrie.py), sans dépendance externe."""
+    if not rings or not rings[0]:
+        return None
+    xs = [pt[0] for pt in rings[0]]
+    ys = [pt[1] for pt in rings[0]]
+    return sum(xs) / len(xs), sum(ys) / len(ys)
 
 
 class CadastreService:
@@ -156,8 +168,85 @@ class CadastreService:
             if codes_rue and not (codes_rue & set(codes_postaux)):
                 return parcelles
 
-        parcelles.extend(self._parcelles_cadastrales_sans_adresse(pays, commune, rue, parcelles))
+        sans_adresse = self._parcelles_cadastrales_sans_adresse(pays, commune, rue, parcelles)
+
+        # Côté ("G"/"D") et position le long de la rue (voir
+        # utils/geometrie.py) — calculés pour les parcelles AVEC adresse ici
+        # (celles sans adresse l'ont déjà, calculé/mis en cache dans
+        # `_parcelles_cadastrales_sans_adresse`). Un HTTP GET identique au
+        # tracé déjà interrogé pour la découverte sans adresse (ou déjà en
+        # cache si cette rue est marquée vérifiée) : pas de coût réseau
+        # supplémentaire réel, juste une lecture de cache dans la majorité
+        # des cas.
+        troncons = self.recuperer_troncons(commune, rue)
+        segments = construire_segments(troncons)
+        for p in parcelles:
+            if p.x is None or p.y is None:
+                continue
+            resultat = cote_et_position(p.x, p.y, segments)
+            if resultat is not None:
+                p.cote, p.position_rue = resultat
+
+        parcelles.extend(sans_adresse)
         return parcelles
+
+    def recuperer_troncons(self, commune: str, rue: str) -> List[Dict[str, Any]]:
+        """Tronçons PICC ("Voirie - Axe") du tracé réel de la rue — voir
+        `utils/geometrie.py`. Factorisé car utilisé à la fois pour la
+        découverte des parcelles sans adresse et pour situer les parcelles
+        AVEC adresse (côté/position)."""
+        return self._client.query_layer(
+            service_url=config.ARCGIS_SERVICES["PICC_VOIRIE"],
+            layer_id=_PICC_VOIRIE_AXE_LAYER_ID,
+            where=f"RUE_NOM1 = '{self._escape(rue)}' AND COMMU_NOM1 = '{self._escape(commune)}'",
+            out_fields="OBJECTID",
+            return_geometry=True,
+        )
+
+    def point_pour_identifiant(self, identifiant: str) -> Optional[Tuple[float, float]]:
+        """Retrouve un point représentatif (x, y) pour une parcelle DÉJÀ
+        résolue, à partir de son seul `identifiant` — sert au rattrapage
+        côté/position (voir main.py::recalculer_cote_position) pour les
+        parcelles traitées avant l'ajout de ce calcul, dont la géométrie
+        n'a jamais été conservée dans `parcelle.valeurs` (seules les
+        colonnes du tableau Excel le sont).
+
+        `identifiant` encode soit un `adr_id` ICAR (parcelles avec
+        adresse : "Commune|ICAR:12345"), soit un `capakey` CADMAP
+        (parcelles sans adresse : "Commune|CAPAKEY:...") — voir
+        `models.parcelle.Parcelle.identifiant`. Une seule requête ciblée
+        (par ADR_ID ou par CAPAKEY), jamais une redécouverte de toute la
+        rue. `None` pour un identifiant au format le plus ancien (ni
+        ICAR ni CAPAKEY — rue+numéro seul), trop ambigu pour être
+        retrouvé de façon fiable."""
+        if "|ICAR:" in identifiant:
+            adr_id = identifiant.rsplit("|ICAR:", 1)[1]
+            features = self._client.query_layer(
+                service_url=config.ARCGIS_SERVICES["ICAR_ADR_PT"],
+                layer_id=_ICAR_ADRESSES_LAYER_ID,
+                where=f"ADR_ID = {adr_id}",
+                out_fields="ADR_ID",
+                return_geometry=True,
+            )
+            if features and features[0].get("geometry"):
+                geom = features[0]["geometry"]
+                return geom["x"], geom["y"]
+            return None
+
+        if "|CAPAKEY:" in identifiant:
+            capakey = identifiant.rsplit("|CAPAKEY:", 1)[1]
+            features = self._client.query_layer(
+                service_url=config.ARCGIS_SERVICES["CADMAP_PARCELLES"],
+                layer_id=_CADMAP_LAYER_ID,
+                where=f"CAPAKEY = '{self._escape(capakey)}'",
+                out_fields="CAPAKEY",
+                return_geometry=True,
+            )
+            if features and features[0].get("geometry"):
+                return _centre_polygone(features[0]["geometry"].get("rings", []))
+            return None
+
+        return None
 
     # -- Parcelles cadastrales sans adresse (complétion CADMAP + PICC) ------
 
@@ -190,18 +279,12 @@ class CadastreService:
                 Parcelle(
                     pays=pays, code_postal=p["code_postal"] or "/", commune=commune, rue=rue,
                     numero="/", capakey=p["capakey"], numero_cadastral=p["numero_cadastral"],
-                    geometry=p["geometry"],
+                    geometry=p["geometry"], cote=p.get("cote"), position_rue=p.get("position_rue"),
                 )
                 for p in self._progress_store.parcelles_sans_adresse(commune, rue)
             ]
 
-        troncons = self._client.query_layer(
-            service_url=config.ARCGIS_SERVICES["PICC_VOIRIE"],
-            layer_id=_PICC_VOIRIE_AXE_LAYER_ID,
-            where=f"RUE_NOM1 = '{self._escape(rue)}' AND COMMU_NOM1 = '{self._escape(commune)}'",
-            out_fields="OBJECTID",
-            return_geometry=True,
-        )
+        troncons = self.recuperer_troncons(commune, rue)
         if not troncons:
             if self._progress_store is not None:
                 self._progress_store.enregistrer_parcelles_sans_adresse(commune, rue, [])
@@ -236,6 +319,7 @@ class CadastreService:
 
         points_icar = [(p.x, p.y) for p in parcelles_icar if p.x is not None and p.y is not None]
         code_postal = self._code_postal_le_plus_frequent(parcelles_icar)
+        segments = construire_segments(troncons)
 
         nouvelles: List[Parcelle] = []
         for capakey, feature in capakeys_vus.items():
@@ -243,7 +327,7 @@ class CadastreService:
             if any(_point_dans_polygone(x, y, rings) for x, y in points_icar):
                 continue  # déjà couverte par une adresse ICAR
             attrs = feature["attributes"]
-            nouvelles.append(Parcelle(
+            parcelle = Parcelle(
                 pays=pays,
                 code_postal=code_postal,
                 commune=commune,
@@ -252,7 +336,13 @@ class CadastreService:
                 capakey=capakey,
                 numero_cadastral=self._format_numero_cadastral(attrs),
                 geometry=feature.get("geometry"),
-            ))
+            )
+            centre = _centre_polygone(rings)
+            if centre is not None:
+                resultat = cote_et_position(centre[0], centre[1], segments)
+                if resultat is not None:
+                    parcelle.cote, parcelle.position_rue = resultat
+            nouvelles.append(parcelle)
         _logger.info(
             "%d parcelle(s) cadastrale(s) sans adresse trouvée(s) pour la rue '%s' (commune '%s').",
             len(nouvelles), rue, commune,
@@ -262,6 +352,7 @@ class CadastreService:
                 {
                     "capakey": n.capakey, "numero_cadastral": n.numero_cadastral,
                     "code_postal": n.code_postal, "geometry": n.geometry,
+                    "cote": n.cote, "position_rue": n.position_rue,
                 }
                 for n in nouvelles
             ])

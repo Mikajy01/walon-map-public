@@ -140,6 +140,16 @@ class ProgressStore:
                 )
                 """
             )
+            # Ajoutées après coup (voir utils/geometrie.py) : `ALTER TABLE
+            # ADD COLUMN` plutôt que `CREATE TABLE IF NOT EXISTS`, qui ne
+            # touche jamais une table déjà existante — nécessaire pour que
+            # les bases déjà commitées (Dour/Chimay/Colfontaine) restent
+            # utilisables sans réinitialisation.
+            colonnes = {row[1] for row in conn.execute("PRAGMA table_info(parcelles_sans_adresse)")}
+            if "cote" not in colonnes:
+                conn.execute("ALTER TABLE parcelles_sans_adresse ADD COLUMN cote TEXT")
+            if "position_rue" not in colonnes:
+                conn.execute("ALTER TABLE parcelles_sans_adresse ADD COLUMN position_rue REAL")
             conn.commit()
 
     def rue_deja_verifiee(self, commune: str, rue: str) -> bool:
@@ -152,10 +162,13 @@ class ProgressStore:
     def parcelles_sans_adresse(self, commune: str, rue: str) -> List[Dict[str, Any]]:
         """Parcelles sans adresse déjà découvertes pour cette rue (voir
         `rue_deja_verifiee` — à n'appeler que si True, sinon liste
-        trompeusement vide pour une rue jamais vérifiée)."""
+        trompeusement vide pour une rue jamais vérifiée). `cote`/
+        `position_rue` valent `None` pour une entrée enregistrée avant
+        l'ajout de ce calcul (voir utils/geometrie.py) — pas encore
+        recalculée, voir le passage de rattrapage dédié."""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT capakey, numero_cadastral, code_postal, geometry "
+                "SELECT capakey, numero_cadastral, code_postal, geometry, cote, position_rue "
                 "FROM parcelles_sans_adresse WHERE commune = ? AND rue = ?",
                 (commune, rue),
             ).fetchall()
@@ -165,8 +178,10 @@ class ProgressStore:
                 "numero_cadastral": numero_cadastral,
                 "code_postal": code_postal,
                 "geometry": json.loads(geometry) if geometry else None,
+                "cote": cote,
+                "position_rue": position_rue,
             }
-            for capakey, numero_cadastral, code_postal, geometry in rows
+            for capakey, numero_cadastral, code_postal, geometry, cote, position_rue in rows
         ]
 
     def enregistrer_parcelles_sans_adresse(
@@ -183,13 +198,26 @@ class ProgressStore:
             for p in parcelles:
                 conn.execute(
                     "INSERT OR REPLACE INTO parcelles_sans_adresse "
-                    "(commune, rue, capakey, numero_cadastral, code_postal, geometry) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(commune, rue, capakey, numero_cadastral, code_postal, geometry, cote, position_rue) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         commune, rue, p["capakey"], p.get("numero_cadastral"),
                         p.get("code_postal"), json.dumps(p.get("geometry")),
+                        p.get("cote"), p.get("position_rue"),
                     ),
                 )
+            conn.commit()
+
+    def maj_cote_position_sans_adresse(self, commune: str, rue: str, capakey: str, cote: str, position_rue: float) -> None:
+        """Met à jour côté/position d'une parcelle sans adresse déjà
+        enregistrée, sans toucher au reste (utilisé par le rattrapage —
+        voir main.py::recalculer_cote_position)."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE parcelles_sans_adresse SET cote = ?, position_rue = ? "
+                "WHERE commune = ? AND rue = ? AND capakey = ?",
+                (cote, position_rue, commune, rue, capakey),
+            )
             conn.commit()
 
     def get(self, commune: str, identifiant: str) -> Optional[dict]:

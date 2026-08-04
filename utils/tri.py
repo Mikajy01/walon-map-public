@@ -1,4 +1,13 @@
-"""Tri des lignes du fichier de sortie par rue puis numéro cadastral."""
+"""Tri des lignes du fichier de sortie : par rue, puis par côté (toutes les
+parcelles d'un côté de la rue, dans l'ordre où on les croise en marchant,
+puis toutes celles de l'autre côté) — voir utils/geometrie.py.
+
+Demandé par le client à la place d'un tri par simple numéro : plus fidèle à
+une vérification manuelle sur le terrain, et fonctionne aussi bien pour les
+parcelles sans adresse (numéro = "/", conformes à la règle métier du
+document Word) que pour celles avec adresse, puisque le côté/la position
+sont calculés géométriquement, indépendamment du numéro pair/impair.
+"""
 
 from __future__ import annotations
 
@@ -14,13 +23,10 @@ _MOTIF_NUMERO_CADASTRAL = re.compile(r"^(\d+)(?:/(\d+))?([A-Za-z]*)(\d*)$")
 
 def _cle_numero_cadastral(numero_cadastral: str) -> tuple:
     """Clé de tri numérique pour un numéro cadastral (radical, bis,
-    exposant, puissance) — pas un tri texte, qui donnerait par exemple
-    "1..." avant "14..." avant "2...", mélangeant les radicaux au lieu de
-    les ordonner 1, 2, 3, ..., 14 (observé en conditions réelles, réclamé
-    par un relecteur client : "tous les numéros cadastraux sont dans le
-    désordre" — commune Colfontaine). Une valeur qui ne correspond pas au
-    format attendu (ex: "/", rattachement cadastral introuvable) est
-    triée après toutes les valeurs reconnues, par texte entre elles."""
+    exposant, puissance) — pas un tri texte. Sert de repli pour les lignes
+    traitées avant l'ajout du calcul côté/position (voir `cle_tri_parcelle`),
+    et de repli final pour départager deux parcelles au même côté/position
+    exacts (rare)."""
     m = _MOTIF_NUMERO_CADASTRAL.match(numero_cadastral or "")
     if not m:
         return (1, 0, 0, "", 0, numero_cadastral or "")
@@ -36,11 +42,27 @@ def _cle_numero_cadastral(numero_cadastral: str) -> tuple:
 
 
 def cle_tri_parcelle(valeurs: Dict[str, str]) -> tuple:
-    """Clé de tri (rue, numéro cadastral) — voir `_cle_numero_cadastral`.
-    Le numéro cadastral (colonne F), pas le numéro d'adresse (colonne E),
-    est le critère de tri : c'est celui que le document Word et le
-    relecteur utilisent pour vérifier le travail, et c'est le seul critère
-    disponible pour les parcelles sans adresse (numéro = "/", conformes à
-    la règle métier — voir CadastreService)."""
+    """Clé de tri (rue, côté, position). `_cote`/`_position` (colonnes
+    internes, jamais écrites dans l'Excel — voir main.py::
+    _set_identification_columns) ne sont disponibles que pour les
+    parcelles traitées après l'ajout de ce calcul ; une ligne qui ne les a
+    pas encore (à recalculer — voir main.py::recalculer_cote_position) est
+    triée après toutes celles qui les ont, par numéro cadastral entre
+    elles comme avant. Toutes les clés renvoyées ont la même forme
+    (comparable entre elles sans erreur de type), qu'une ligne ait ou non
+    déjà son côté/position."""
     rue = valeurs.get("D", "")
-    return (rue, *_cle_numero_cadastral(valeurs.get("F", "")))
+    cote = valeurs.get("_cote")
+    position = valeurs.get("_position")
+
+    a_cote_position = cote is not None and position is not None
+    groupe = 0 if a_cote_position else 1
+    cle_cadastral = _cle_numero_cadastral(valeurs.get("F", "")) if not a_cote_position else (0, 0, 0, "", 0, "")
+
+    return (
+        rue,
+        groupe,
+        cote if cote is not None else "",
+        float(position) if position is not None else 0.0,
+        *cle_cadastral,
+    )

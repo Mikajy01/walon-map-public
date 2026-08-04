@@ -32,6 +32,7 @@ from services.cadastre_service import CadastreService
 from services.excel_service import ExcelService
 from services.geoportail_service import ArcGISRestClient
 from services.layers_service import LayersService
+from utils.geometrie import construire_segments, cote_et_position
 from utils.logger import get_logger, setup_logging
 from utils.progress import progress
 from utils.rate_limiter import RateLimiter
@@ -127,6 +128,14 @@ def parse_args() -> argparse.Namespace:
              "Excel doit alors être écrit dans le second, pas dans le checkout du "
              "premier.",
     )
+    parser.add_argument(
+        "--recalculer-cote-position", action="store_true",
+        help="Rattrapage, au lieu du traitement normal : calcule côté/position "
+             "(voir utils/geometrie.py) pour les parcelles déjà résolues avant "
+             "l'ajout de ce calcul. À lancer une fois par commune (ex: workflow "
+             "GitHub Actions dédié) — les parcelles traitées normalement l'ont "
+             "déjà, --limit et --code-postal sont ignorés dans ce mode.",
+    )
     return parser.parse_args()
 
 
@@ -159,6 +168,15 @@ def _set_identification_columns(parcelle: Parcelle) -> None:
     parcelle.valeurs["D"] = parcelle.rue
     parcelle.valeurs["E"] = parcelle.numero or "/"
     parcelle.valeurs["F"] = parcelle.numero_cadastral or "/"
+    # Clés internes (préfixe "_", jamais une vraie lettre de colonne — voir
+    # excel_service.write_parcelles, qui n'écrit que column_order, ignore
+    # tout le reste) : côté/position le long de la rue, utilisées
+    # uniquement pour le tri de sortie (voir utils/tri.py). Absentes pour
+    # les parcelles traitées avant l'ajout de ce calcul — le tri s'y adapte.
+    if parcelle.cote is not None:
+        parcelle.valeurs["_cote"] = parcelle.cote
+    if parcelle.position_rue is not None:
+        parcelle.valeurs["_position"] = parcelle.position_rue
 
 
 def traiter_commune(
@@ -297,11 +315,11 @@ def traiter_commune(
             else:
                 a_faire.append(parcelle)
 
-    a_traiter_cette_execution = a_faire if limit is None else a_faire[:limit]
+    objectif = limit if limit is not None else len(a_faire)
     _logger.info(
         "Commune '%s' : %d parcelle(s) au total, %d déjà traitée(s), "
-        "%d à traiter à cette exécution%s.",
-        commune, total_adresses, len(deja_faites), len(a_traiter_cette_execution),
+        "objectif de %d nouvelle(s) parcelle(s) réussie(s) à cette exécution%s.",
+        commune, total_adresses, len(deja_faites), min(objectif, len(a_faire)),
         "" if limit is None else f" (limite={limit})",
     )
     if parcelles_retentees:
@@ -311,24 +329,70 @@ def traiter_commune(
             commune, parcelles_retentees, cellules_corrigees,
         )
 
+    # Une parcelle qui échoue (`Exception` inattendue, ex: incident réseau
+    # après épuisement des réessais) est remplacée par la suivante dans la
+    # file plutôt que de faire simplement baisser le total de cette
+    # exécution : sans ça, `--limit 550` avec 18 échecs donnait 532
+    # nouvelles parcelles au lieu de 550 (observé en conditions réelles),
+    # même si la parcelle manquée est de toute façon retentée un jour
+    # (jamais enregistrée, donc redécouverte au prochain lancement — voir
+    # plus haut) — autant ne pas attendre une exécution de plus quand il
+    # reste des parcelles disponibles pour combler l'écart tout de suite.
+    #
+    # La compensation est bornée à 2x l'objectif plutôt qu'illimitée
+    # (jusqu'à épuisement de `a_faire`) : un run GitHub Actions est
+    # plafonné à 6h par GitHub (voir timeout-minutes dans le workflow),
+    # indépendamment du quota de minutes/mois (qui lui ne s'applique plus,
+    # dépôt public) — un taux d'échec anormalement élevé (ex: panne réseau
+    # partielle côté Géoportail) ne doit pas faire tenter la totalité de la
+    # file d'une commune en un seul run et risquer de ne rien terminer
+    # avant la coupure. 2x couvre largement un taux d'échec réaliste (18
+    # échecs sur 550, soit ~3%, dans le cas observé ci-dessus) sans risque
+    # d'emballement ; aucune parcelle n'est perdue si le plafond est
+    # atteint avant l'objectif, elle est simplement retentée au run
+    # suivant (jamais enregistrée tant qu'elle n'a pas réussi).
     nouvellement_traitees: List[Parcelle] = []
-    for parcelle_index, parcelle in enumerate(
-        progress(
-            a_traiter_cette_execution, total=len(a_traiter_cette_execution),
-            description=f"Remplissage ({commune})",
-        )
+    parcelles_tentees = 0
+    cible = min(objectif, len(a_faire))
+    plafond_tentatives = min(len(a_faire), objectif * 2)
+
+    def _traiter_jusqu_a_objectif():
+        nonlocal parcelles_tentees
+        for parcelle in a_faire:
+            if len(nouvellement_traitees) >= objectif or parcelles_tentees >= plafond_tentatives:
+                return
+            parcelles_tentees += 1
+            try:
+                cadastre_service.rattacher_parcelle_cadastrale(parcelle)
+                _set_identification_columns(parcelle)
+                layers_service.resolve_all(parcelle)
+            except Exception:  # noqa: BLE001 - ne jamais interrompre le traitement des autres parcelles
+                _logger.exception("Échec inattendu pour la parcelle %s, ligne ignorée.", parcelle.identifiant)
+                continue
+            progress_store.set(commune, parcelle.identifiant, parcelle.valeurs)
+            nouvellement_traitees.append(parcelle)
+            yield parcelle
+
+    for parcelle_index, _ in enumerate(
+        progress(_traiter_jusqu_a_objectif(), total=cible, description=f"Remplissage ({commune})")
     ):
         if on_progress:
-            on_progress("remplissage", parcelle_index + 1, len(a_traiter_cette_execution))
-        try:
-            cadastre_service.rattacher_parcelle_cadastrale(parcelle)
-            _set_identification_columns(parcelle)
-            layers_service.resolve_all(parcelle)
-        except Exception:  # noqa: BLE001 - ne jamais interrompre le traitement des autres parcelles
-            _logger.exception("Échec inattendu pour la parcelle %s, ligne ignorée.", parcelle.identifiant)
-            continue
-        progress_store.set(commune, parcelle.identifiant, parcelle.valeurs)
-        nouvellement_traitees.append(parcelle)
+            on_progress("remplissage", parcelle_index + 1, cible)
+
+    if parcelles_tentees > len(nouvellement_traitees):
+        _logger.info(
+            "Commune '%s' : %d parcelle(s) tentée(s) pour obtenir %d nouvelle(s) réussie(s) "
+            "(%d échec(s) remplacé(s) automatiquement).",
+            commune, parcelles_tentees, len(nouvellement_traitees),
+            parcelles_tentees - len(nouvellement_traitees),
+        )
+        if len(nouvellement_traitees) < objectif and parcelles_tentees >= plafond_tentatives:
+            _logger.warning(
+                "Commune '%s' : plafond de compensation (%d tentative(s)) atteint avant d'obtenir "
+                "les %d nouvelle(s) parcelle(s) demandée(s) — taux d'échec anormalement élevé "
+                "sur cette exécution, %d obtenue(s) seulement. Le reste sera retenté au prochain "
+                "lancement.", commune, plafond_tentatives, objectif, len(nouvellement_traitees),
+            )
 
     parcelles_resolues = deja_faites + nouvellement_traitees
     restantes = total_adresses - len(parcelles_resolues)
@@ -343,6 +407,27 @@ def traiter_commune(
     # --code-postal éventuel de cette exécution), pour ne jamais faire
     # disparaître du fichier des lignes résolues lors d'exécutions
     # précédentes avec un filtre différent (ou sans filtre).
+    final_output_path = _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
+    return ResultatTraitement(
+        output_path=final_output_path,
+        total_adresses=total_adresses,
+        parcelles_resolues=len(parcelles_resolues),
+        restantes=restantes,
+        filtre_actif=bool(codes_postaux),
+    )
+
+
+def _reconstruire_fichier_sortie(
+    commune: str,
+    progress_store: ProgressStore,
+    excel_service: ExcelService,
+    output_path: Optional[Path] = None,
+) -> Path:
+    """Reconstruit le fichier Excel de sortie à partir de la totalité des
+    parcelles déjà résolues pour la commune — appelé par `traiter_commune`
+    après chaque exécution, et par `recalculer_cote_position` après avoir
+    mis à jour côté/position sur des parcelles déjà résolues (même besoin :
+    relire `progress_store`, trier, réécrire)."""
     toutes_valeurs_commune = list(progress_store.all_for_commune(commune).values())
     toutes_valeurs_commune.sort(key=cle_tri_parcelle)
 
@@ -364,13 +449,79 @@ def traiter_commune(
         chemin_archive = _chemin_archive_disponible(final_output_path.parent, commune)
         shutil.copy2(final_output_path, chemin_archive)
         _logger.info("Copie datée archivée : %s", chemin_archive)
-    return ResultatTraitement(
-        output_path=final_output_path,
-        total_adresses=total_adresses,
-        parcelles_resolues=len(parcelles_resolues),
-        restantes=restantes,
-        filtre_actif=bool(codes_postaux),
-    )
+    return final_output_path
+
+
+def recalculer_cote_position(
+    commune: str,
+    cadastre_service: CadastreService,
+    progress_store: ProgressStore,
+    excel_service: ExcelService,
+    output_path: Optional[Path] = None,
+    on_progress: Optional[ProgressCallback] = None,
+) -> int:
+    """Rattrapage pour les parcelles déjà résolues AVANT l'ajout du calcul
+    côté/position (voir utils/geometrie.py) — les parcelles traitées par
+    `traiter_commune` depuis cet ajout l'ont déjà (voir
+    `_set_identification_columns`), inutile de les repasser ici.
+
+    Regroupe les parcelles à corriger par rue pour ne récupérer le tracé
+    PICC (`recuperer_troncons`) qu'une seule fois par rue plutôt qu'une
+    fois par parcelle. Renvoie le nombre de parcelles effectivement
+    corrigées (0 si la commune n'a rien à rattraper)."""
+    base = progress_store.all_for_commune(commune)
+    a_corriger: dict = {}
+    for identifiant, valeurs in base.items():
+        if "_cote" in valeurs and "_position" in valeurs:
+            continue
+        a_corriger.setdefault(valeurs.get("D", ""), []).append((identifiant, valeurs))
+
+    total_corrigees = 0
+    rues = list(a_corriger.items())
+    for rue_index, (rue, entrees) in enumerate(rues):
+        if on_progress:
+            on_progress("recalcul_côté_position", rue_index + 1, len(rues))
+        troncons = cadastre_service.recuperer_troncons(commune, rue)
+        segments = construire_segments(troncons)
+        if not segments:
+            _logger.warning(
+                "Rue '%s' (%s) : tracé PICC introuvable, côté/position non calculables "
+                "pour %d parcelle(s).", rue, commune, len(entrees),
+            )
+            continue
+        for identifiant, valeurs in entrees:
+            point = cadastre_service.point_pour_identifiant(identifiant)
+            if point is None:
+                continue
+            resultat = cote_et_position(point[0], point[1], segments)
+            if resultat is None:
+                continue
+            cote, position = resultat
+            valeurs["_cote"] = cote
+            valeurs["_position"] = position
+            progress_store.set(commune, identifiant, valeurs)
+            # Les parcelles sans adresse ICAR (identifiant "...|CAPAKEY:...",
+            # voir Parcelle.identifiant) ont aussi une entrée dans le cache
+            # de découverte dédié (parcelles_sans_adresse) : à garder en
+            # cohérence, sinon une future découverte sur la même rue
+            # réécraserait cote/position avec les None d'origine.
+            if "|CAPAKEY:" in identifiant:
+                capakey = identifiant.rsplit("CAPAKEY:", 1)[-1]
+                progress_store.maj_cote_position_sans_adresse(commune, rue, capakey, cote, position)
+            total_corrigees += 1
+
+    if total_corrigees:
+        _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
+        _logger.info(
+            "Commune '%s' : %d parcelle(s) corrigée(s) (côté/position calculés rétroactivement).",
+            commune, total_corrigees,
+        )
+    else:
+        _logger.info(
+            "Commune '%s' : rien à corriger (toutes les parcelles déjà résolues ont "
+            "déjà côté/position).", commune,
+        )
+    return total_corrigees
 
 
 def main() -> int:
@@ -395,9 +546,14 @@ def main() -> int:
     excel_service = ExcelService(args.template or config.TEMPLATE_PATH)
 
     resultats: List[ResultatTraitement] = []
+    recalcul_reussi = False
     for commune in args.communes:
         try:
             output_path = (args.output_dir / f"{commune}.xlsx") if args.output_dir else None
+            if args.recalculer_cote_position:
+                recalculer_cote_position(commune, cadastre_service, progress_store, excel_service, output_path=output_path)
+                recalcul_reussi = True
+                continue
             resultat = traiter_commune(
                 commune, args.pays,
                 cadastre_service, layers_service, progress_store, excel_service,
@@ -420,7 +576,7 @@ def main() -> int:
                 "commande pour continuer.", resultat.restantes, resultat.total_adresses,
             )
 
-    return 0 if resultats else 1
+    return 0 if (resultats or recalcul_reussi) else 1
 
 
 if __name__ == "__main__":

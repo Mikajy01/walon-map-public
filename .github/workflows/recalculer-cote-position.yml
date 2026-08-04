@@ -1,0 +1,145 @@
+name: Recalculer côté/position (rattrapage)
+
+# Rattrapage à lancer UNE FOIS par commune, séparément du traitement normal
+# ("Traiter une commune") : calcule côté/position le long de la rue (voir
+# utils/geometrie.py) pour les parcelles déjà résolues AVANT l'ajout de ce
+# calcul — nécessaire pour le tri de sortie demandé par le client (toutes
+# les parcelles d'un côté, dans l'ordre où on les croise, puis l'autre
+# côté). Les parcelles traitées par le workflow normal depuis cet ajout
+# l'ont déjà (voir main.py::_set_identification_columns) ; relancer ce
+# workflow dessus ne fait rien (main.py::recalculer_cote_position ignore
+# toute parcelle qui a déjà côté/position).
+#
+# Même architecture à deux dépôts que "Traiter une commune" : ce dépôt
+# (public, minutes Actions illimitées) exécute le code, le dépôt privé
+# Mikajy01/walon-map-data (jeton en secret DATA_REPO_TOKEN) contient la
+# vraie progression et reçoit les corrections.
+on:
+  workflow_dispatch:
+    inputs:
+      commune:
+        description: "Commune à rattraper"
+        required: true
+        type: string
+      rate_limit:
+        description: "Requêtes par seconde vers le Géoportail"
+        required: false
+        default: "5"
+        type: string
+      debug:
+        description: "Journalisation détaillée (DEBUG)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # Même groupe que "Traiter une commune" pour LA MÊME commune : les deux
+  # workflows lisent/écrivent le même fichier de cache
+  # (donnees/cache/<commune>/http_cache.sqlite3), qu'il ne faut jamais
+  # laisser toucher par deux exécutions en parallèle.
+  group: traiter-commune-${{ inputs.commune }}
+  cancel-in-progress: false
+
+jobs:
+  recalculer:
+    runs-on: ubuntu-latest
+    # Plus rapide que le traitement normal (pas de résolution des ~90
+    # couches métier, seulement une requête PICC par rue + une requête
+    # ciblée par parcelle à corriger), mais une commune peut avoir des
+    # milliers de parcelles à rattraper la première fois : marge sous la
+    # limite de 6h des runners hébergés GitHub.
+    timeout-minutes: 340
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Récupérer les données existantes (dépôt privé séparé)
+        run: |
+          set -e
+          git clone --depth 1 "https://x-access-token:${{ secrets.DATA_REPO_TOKEN }}@github.com/Mikajy01/walon-map-data.git" donnees
+          mkdir -p donnees/cache donnees/output donnees/logs
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Lancer le recalcul côté/position
+        run: |
+          set -e
+          ARGS=(--commune "${{ inputs.commune }}"
+                --recalculer-cote-position
+                --rate-limit "${{ inputs.rate_limit }}"
+                --template "Entête walonmap (avec colonnes en plus).xlsx"
+                --cache-dir "donnees/cache/${{ inputs.commune }}"
+                --logs-dir "donnees/logs/${{ inputs.commune }}"
+                --output-dir "donnees/output")
+          if [ "${{ inputs.debug }}" = "true" ]; then
+            ARGS+=(--debug)
+          fi
+          python main.py "${ARGS[@]}"
+
+      - name: Vider le cache HTTP brut avant de committer
+        if: always()
+        # Même raison que dans "Traiter une commune" : le cache HTTP brut
+        # (table `http_cache`) n'a de valeur que pendant l'exécution en
+        # cours, le laisser s'accumuler ferait dépasser la limite de 100 Mo
+        # de GitHub. `parcelle_resultats` (la vraie progression, avec les
+        # côté/position corrigés) n'est jamais touché par ce nettoyage.
+        run: |
+          python -c "
+          import sqlite3
+          from pathlib import Path
+          db_path = Path('donnees/cache/${{ inputs.commune }}/http_cache.sqlite3')
+          if not db_path.exists():
+              print('Pas de fichier de cache (le recalcul a probablement échoué avant toute écriture) : rien à nettoyer.')
+          else:
+              conn = sqlite3.connect(db_path)
+              table_existe = conn.execute(
+                  \"SELECT 1 FROM sqlite_master WHERE type='table' AND name='http_cache'\"
+              ).fetchone()
+              if table_existe:
+                  conn.execute('DELETE FROM http_cache')
+                  conn.commit()  # VACUUM ne peut pas tourner dans une transaction ouverte
+                  conn.execute('VACUUM')
+                  print('Cache HTTP vidé.')
+              conn.close()
+          "
+
+      - name: Committer et pousser les résultats (dépôt de données)
+        if: always()
+        # `if: always()` : même interrompu (timeout, quota, erreur), tout
+        # ce qui a déjà été corrigé jusque-là reste dans
+        # donnees/cache/<commune>/http_cache.sqlite3 — on le committe quand
+        # même pour ne jamais perdre le travail déjà fait (une exécution
+        # future reprend exactement où celle-ci s'est arrêtée, voir
+        # main.py::recalculer_cote_position qui ignore toute parcelle déjà
+        # corrigée).
+        run: |
+          cd donnees
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f "cache/${{ inputs.commune }}/http_cache.sqlite3" \
+                     "logs/${{ inputs.commune }}/" \
+                     "output/${{ inputs.commune }}.xlsx" 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "Rien de nouveau à committer."
+            exit 0
+          fi
+          git commit -m "Recalcul côté/position : ${{ inputs.commune }} (${{ github.run_id }})"
+          for tentative in 1 2 3 4 5; do
+            if git push; then
+              exit 0
+            fi
+            echo "Push refusé (tentative $tentative/5), nouvel essai après rebase..."
+            git pull --rebase
+          done
+          echo "Échec du push après 5 tentatives." >&2
+          exit 1
