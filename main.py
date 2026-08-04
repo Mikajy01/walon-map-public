@@ -66,6 +66,22 @@ class ResultatTraitement:
         return self.restantes == 0
 
 
+@dataclass
+class RapportEchecs:
+    """Résultat d'un appel à `retraiter_echecs` — permet à l'appelant (CLI,
+    GUI, GitHub Actions) de savoir combien de parcelles en échec restent,
+    pour décider s'il faut relancer une nouvelle fois ce rattrapage ciblé."""
+
+    tentees: int
+    reussies: int
+    restantes: int
+
+    @property
+    def termine(self) -> bool:
+        """True si plus aucune parcelle en échec ne reste pour cette commune."""
+        return self.restantes == 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Remplit le fichier Excel Walonmap à partir du Géoportail de Wallonie."
@@ -136,6 +152,15 @@ def parse_args() -> argparse.Namespace:
              "GitHub Actions dédié) — les parcelles traitées normalement l'ont "
              "déjà, --limit et --code-postal sont ignorés dans ce mode.",
     )
+    parser.add_argument(
+        "--retraiter-echecs", action="store_true",
+        help="Rattrapage, au lieu du traitement normal : retente UNIQUEMENT les "
+             "parcelles enregistrées en échec lors d'une exécution précédente "
+             "(voir main.py::retraiter_echecs), sans les mélanger avec le reste de "
+             "la commune non encore traitée. Peut être relancé plusieurs fois de "
+             "suite jusqu'à ce qu'il n'y ait plus aucun échec. --limit et "
+             "--code-postal sont ignorés dans ce mode.",
+    )
     return parser.parse_args()
 
 
@@ -177,6 +202,20 @@ def _set_identification_columns(parcelle: Parcelle) -> None:
         parcelle.valeurs["_cote"] = parcelle.cote
     if parcelle.position_rue is not None:
         parcelle.valeurs["_position"] = parcelle.position_rue
+
+
+def _resoudre_une_parcelle(
+    parcelle: Parcelle, cadastre_service: CadastreService, layers_service: LayersService,
+) -> None:
+    """Tente de résoudre entièrement UNE parcelle (rattachement cadastral +
+    toutes les colonnes) — utilisé par la boucle normale de remplissage
+    (`traiter_commune`) et par le retraitement ciblé des échecs
+    (`retraiter_echecs`), pour ne jamais dupliquer cette séquence. Ne
+    capture PAS les exceptions : à l'appelant de décider quoi faire d'un
+    échec (remplacer par une autre parcelle, enregistrer l'échec, etc.)."""
+    cadastre_service.rattacher_parcelle_cadastrale(parcelle)
+    _set_identification_columns(parcelle)
+    layers_service.resolve_all(parcelle)
 
 
 def traiter_commune(
@@ -363,13 +402,13 @@ def traiter_commune(
                 return
             parcelles_tentees += 1
             try:
-                cadastre_service.rattacher_parcelle_cadastrale(parcelle)
-                _set_identification_columns(parcelle)
-                layers_service.resolve_all(parcelle)
-            except Exception:  # noqa: BLE001 - ne jamais interrompre le traitement des autres parcelles
+                _resoudre_une_parcelle(parcelle, cadastre_service, layers_service)
+            except Exception as exc:  # noqa: BLE001 - ne jamais interrompre le traitement des autres parcelles
                 _logger.exception("Échec inattendu pour la parcelle %s, ligne ignorée.", parcelle.identifiant)
+                progress_store.enregistrer_echec(commune, parcelle, str(exc))
                 continue
             progress_store.set(commune, parcelle.identifiant, parcelle.valeurs)
+            progress_store.supprimer_echec(commune, parcelle.identifiant)
             nouvellement_traitees.append(parcelle)
             yield parcelle
 
@@ -380,11 +419,25 @@ def traiter_commune(
             on_progress("remplissage", parcelle_index + 1, cible)
 
     if parcelles_tentees > len(nouvellement_traitees):
+        echecs = parcelles_tentees - len(nouvellement_traitees)
         _logger.info(
             "Commune '%s' : %d parcelle(s) tentée(s) pour obtenir %d nouvelle(s) réussie(s) "
             "(%d échec(s) remplacé(s) automatiquement).",
-            commune, parcelles_tentees, len(nouvellement_traitees),
-            parcelles_tentees - len(nouvellement_traitees),
+            commune, parcelles_tentees, len(nouvellement_traitees), echecs,
+        )
+        # Rassurance explicite, demandée après que des clients (pas les
+        # collaborateurs qui font tourner l'outil, mais ceux à qui le
+        # travail est vendu) se soient inquiétés en voyant des écarts de
+        # comptage d'une exécution à l'autre, sans savoir que les
+        # parcelles en échec sont automatiquement rattrapées : une
+        # parcelle en échec n'est jamais enregistrée comme traitée (voir
+        # `_traiter_jusqu_a_objectif` ci-dessus), donc rien n'est
+        # réellement perdu, seulement reporté à l'exécution suivante.
+        _logger.info(
+            "Commune '%s' : les %d parcelle(s) en échec ne sont PAS perdues — jamais "
+            "enregistrées comme traitées, elles seront automatiquement redétectées et "
+            "retentées au prochain lancement, sans action manuelle nécessaire.",
+            commune, echecs,
         )
         if len(nouvellement_traitees) < objectif and parcelles_tentees >= plafond_tentatives:
             _logger.warning(
@@ -524,6 +577,69 @@ def recalculer_cote_position(
     return total_corrigees
 
 
+def retraiter_echecs(
+    commune: str,
+    cadastre_service: CadastreService,
+    layers_service: LayersService,
+    progress_store: ProgressStore,
+    excel_service: ExcelService,
+    output_path: Optional[Path] = None,
+    on_progress: Optional[ProgressCallback] = None,
+) -> RapportEchecs:
+    """Retente UNIQUEMENT les parcelles enregistrées en échec par
+    `_traiter_jusqu_a_objectif` (voir `ProgressStore.enregistrer_echec`),
+    sans les mélanger avec le reste de la commune pas encore traitée —
+    contrairement au traitement normal (`traiter_commune`), qui les
+    rattrape aussi mais noyées parmi toute nouvelle parcelle jamais
+    rencontrée. Pensé pour être relancé plusieurs fois de suite jusqu'à ce
+    qu'il n'y ait plus aucun échec, sans devoir retraiter toute la commune
+    entre-temps.
+
+    Chaque parcelle en échec est reconstruite à partir des champs stockés
+    au moment de l'échec (pays, code postal, rue, numéro, adr_id/capakey) ;
+    sa position (x, y) est retrouvée via `CadastreService.point_pour_identifiant`
+    (une requête ciblée par ADR_ID ou CAPAKEY, jamais une redécouverte de
+    toute la rue)."""
+    echecs = progress_store.echecs_commune(commune)
+    total = len(echecs)
+    reussies = 0
+    for index, e in enumerate(echecs):
+        if on_progress:
+            on_progress("retraitement_echecs", index + 1, total)
+        parcelle = Parcelle(
+            pays=e["pays"], code_postal=e["code_postal"], commune=commune,
+            rue=e["rue"], numero=e["numero"], adr_id=e["adr_id"], capakey=e["capakey"],
+        )
+        point = cadastre_service.point_pour_identifiant(parcelle.identifiant)
+        if point is None:
+            _logger.warning(
+                "Parcelle %s : identifiant trop ancien pour être relocalisée directement, "
+                "retirée du suivi des échecs (sera quand même redécouverte normalement au "
+                "prochain traitement complet de la commune).", parcelle.identifiant,
+            )
+            progress_store.supprimer_echec(commune, parcelle.identifiant)
+            continue
+        parcelle.x, parcelle.y = point
+        try:
+            _resoudre_une_parcelle(parcelle, cadastre_service, layers_service)
+        except Exception as exc:  # noqa: BLE001 - un échec répété ne doit jamais arrêter le retraitement des autres
+            _logger.exception("Nouvel échec pour la parcelle %s.", parcelle.identifiant)
+            progress_store.enregistrer_echec(commune, parcelle, str(exc))
+            continue
+        progress_store.set(commune, parcelle.identifiant, parcelle.valeurs)
+        progress_store.supprimer_echec(commune, parcelle.identifiant)
+        reussies += 1
+
+    if reussies:
+        _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
+    restantes = total - reussies
+    _logger.info(
+        "Commune '%s' : %d/%d parcelle(s) en échec retraitée(s) avec succès (%d encore en échec).",
+        commune, reussies, total, restantes,
+    )
+    return RapportEchecs(tentees=total, reussies=reussies, restantes=restantes)
+
+
 def main() -> int:
     args = parse_args()
     config.DEBUG = args.debug
@@ -552,6 +668,13 @@ def main() -> int:
             output_path = (args.output_dir / f"{commune}.xlsx") if args.output_dir else None
             if args.recalculer_cote_position:
                 recalculer_cote_position(commune, cadastre_service, progress_store, excel_service, output_path=output_path)
+                recalcul_reussi = True
+                continue
+            if args.retraiter_echecs:
+                retraiter_echecs(
+                    commune, cadastre_service, layers_service, progress_store, excel_service,
+                    output_path=output_path,
+                )
                 recalcul_reussi = True
                 continue
             resultat = traiter_commune(

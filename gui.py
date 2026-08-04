@@ -35,7 +35,7 @@ if sys.stderr is None:
 import customtkinter as ctk
 
 import config
-from main import ResultatTraitement, recalculer_cote_position, traiter_commune
+from main import RapportEchecs, ResultatTraitement, recalculer_cote_position, retraiter_echecs, traiter_commune
 from services.cache_service import CacheService, ProgressStore
 from services.cadastre_service import CadastreService
 from services.excel_service import ExcelService
@@ -199,6 +199,11 @@ class App(ctk.CTk):
             command=self._recalculer_cote_position,
         )
         self.bouton_recalculer_cote_position.pack(side="left", padx=(8, 0))
+        self.bouton_retraiter_echecs = ctk.CTkButton(
+            action, text="Retraiter les parcelles échouées…", height=40,
+            command=self._retraiter_echecs,
+        )
+        self.bouton_retraiter_echecs.pack(side="left", padx=(8, 0))
 
         self.label_statut = ctk.CTkLabel(self, text="Prêt.", anchor="w")
         self.label_statut.pack(fill="x", padx=16, pady=(10, 2))
@@ -272,6 +277,8 @@ class App(ctk.CTk):
             self._fin_synchronisation(rapport=message[1], chemin=message[2], fichier_verrouille=True)
         elif kind == "recalcul_done":
             self._fin_recalcul(n=message[1], chemin=message[2])
+        elif kind == "retraitement_echecs_done":
+            self._fin_retraitement_echecs(rapport=message[1], chemin=message[2])
         elif kind == "error":
             self._fin_traitement(succes=False, erreur=message[1])
 
@@ -287,6 +294,7 @@ class App(ctk.CTk):
         libelles = {
             "découverte": "Découverte des adresses",
             "recalcul_côté_position": "Recalcul côté/position",
+            "retraitement_echecs": "Retraitement des parcelles échouées",
         }
         libelle = libelles.get(phase, "Remplissage des colonnes")
         self.label_statut.configure(text=f"{libelle}… ({actuel}/{total})")
@@ -362,6 +370,8 @@ class App(ctk.CTk):
         self._en_cours = True
         self.bouton_lancer.configure(state="disabled", text="Traitement en cours…")
         self.bouton_importer_corrige.configure(state="disabled")
+        self.bouton_recalculer_cote_position.configure(state="disabled")
+        self.bouton_retraiter_echecs.configure(state="disabled")
         self.bouton_ouvrir_dossier.configure(state="disabled")
         self.barre_progression.set(0)
         self.label_statut.configure(text="Démarrage…")
@@ -428,6 +438,8 @@ class App(ctk.CTk):
         self._en_cours = True
         self.bouton_lancer.configure(state="disabled")
         self.bouton_importer_corrige.configure(state="disabled", text="Importation en cours…")
+        self.bouton_recalculer_cote_position.configure(state="disabled")
+        self.bouton_retraiter_echecs.configure(state="disabled")
         self.bouton_ouvrir_dossier.configure(state="disabled")
         self.barre_progression.set(0)
         self.label_statut.configure(text="Importation et synchronisation en cours…")
@@ -508,6 +520,7 @@ class App(ctk.CTk):
         self.bouton_lancer.configure(state="disabled")
         self.bouton_importer_corrige.configure(state="disabled")
         self.bouton_recalculer_cote_position.configure(state="disabled", text="Recalcul en cours…")
+        self.bouton_retraiter_echecs.configure(state="disabled")
         self.bouton_ouvrir_dossier.configure(state="disabled")
         self.barre_progression.set(0)
         self.label_statut.configure(text="Recalcul côté/position en cours…")
@@ -549,11 +562,86 @@ class App(ctk.CTk):
             logging.getLogger("gui").exception("Échec du recalcul côté/position")
             self._message_queue.put(("error", str(exc)))
 
+    # -- Retraitement ciblé des parcelles échouées ---------------------------
+
+    def _retraiter_echecs(self) -> None:
+        """Retente UNIQUEMENT les parcelles enregistrées en échec (voir
+        main.py::retraiter_echecs) — à la différence de « Démarrer le
+        traitement », qui les rattrape aussi mais mélangées avec le reste
+        de la commune pas encore traitée. Peut être cliqué plusieurs fois
+        de suite jusqu'à ce que le rapport affiche 0 échec restant."""
+        if self._en_cours:
+            return
+        commune = self.entry_commune.get().strip()
+        fichier_entree = self.entry_fichier_entree.get().strip()
+        fichier_sortie = self.entry_fichier_sortie.get().strip()
+        if not commune:
+            messagebox.showerror(APP_TITLE, "Le champ Commune est obligatoire pour retraiter les échecs.")
+            return
+        if not fichier_entree or not Path(fichier_entree).is_file():
+            messagebox.showerror(
+                APP_TITLE, "Choisissez un fichier Excel gabarit valide (sert à réécrire le fichier de sortie).",
+            )
+            return
+        if not fichier_sortie:
+            messagebox.showerror(APP_TITLE, "Choisissez où enregistrer le fichier de sortie.")
+            return
+        if not self._verifier_licence(commune):
+            return
+
+        self._en_cours = True
+        self.bouton_lancer.configure(state="disabled")
+        self.bouton_importer_corrige.configure(state="disabled")
+        self.bouton_recalculer_cote_position.configure(state="disabled")
+        self.bouton_retraiter_echecs.configure(state="disabled", text="Retraitement en cours…")
+        self.bouton_ouvrir_dossier.configure(state="disabled")
+        self.barre_progression.set(0)
+        self.label_statut.configure(text="Retraitement des parcelles échouées en cours…")
+        self.zone_log.configure(state="normal")
+        self.zone_log.delete("1.0", "end")
+        self.zone_log.configure(state="disabled")
+
+        thread = threading.Thread(
+            target=self._executer_retraiter_echecs,
+            args=(commune, Path(fichier_entree), Path(fichier_sortie), self.slider_vitesse.get()),
+            daemon=True,
+        )
+        thread.start()
+
+    def _executer_retraiter_echecs(
+        self, commune: str, fichier_entree: Path, fichier_sortie: Path, rate_limit: float,
+    ) -> None:
+        """Tourne dans un thread d'arrière-plan, comme `_executer` : voir
+        main.py::retraiter_echecs pour la logique elle-même (aucune
+        duplication ici)."""
+        try:
+            cache_service = CacheService(config.CACHE_DIR)
+            progress_store = ProgressStore(config.CACHE_DIR)
+            client = ArcGISRestClient(
+                cache=cache_service, rate_limiter=RateLimiter(rate_limit), timeout=config.HTTP_TIMEOUT_SECONDS,
+            )
+            cadastre_service = CadastreService(client, progress_store)
+            layers_service = LayersService(client, config.LIENS_COMMUNAUX_PATH)
+            excel_service = ExcelService(fichier_entree)
+
+            def on_progress(phase: str, actuel: int, total: int) -> None:
+                self._message_queue.put(("progress", phase, actuel, total))
+
+            rapport = retraiter_echecs(
+                commune, cadastre_service, layers_service, progress_store, excel_service,
+                output_path=fichier_sortie, on_progress=on_progress,
+            )
+            self._message_queue.put(("retraitement_echecs_done", rapport, fichier_sortie))
+        except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
+            logging.getLogger("gui").exception("Échec du retraitement des parcelles échouées")
+            self._message_queue.put(("error", str(exc)))
+
     def _reactiver_boutons(self) -> None:
         self._en_cours = False
         self.bouton_lancer.configure(state="normal", text="Démarrer le traitement")
         self.bouton_importer_corrige.configure(state="normal", text="Importer un Excel corrigé…")
         self.bouton_recalculer_cote_position.configure(state="normal", text="Recalculer côté/position…")
+        self.bouton_retraiter_echecs.configure(state="normal", text="Retraiter les parcelles échouées…")
 
     def _fin_traitement(
         self, succes: bool, resultat: Optional[ResultatTraitement] = None, erreur: Optional[str] = None,
@@ -607,6 +695,30 @@ class App(ctk.CTk):
             texte = f"Recalcul terminé — {n} parcelle(s) corrigée(s) (côté/position). Fichier généré : {chemin}"
         else:
             texte = "Recalcul terminé — rien à corriger (toutes les parcelles avaient déjà côté/position)."
+        self._ajouter_log(texte)
+        self.label_statut.configure(text=texte)
+        messagebox.showinfo(APP_TITLE, texte)
+
+    def _fin_retraitement_echecs(self, rapport: RapportEchecs, chemin: Path) -> None:
+        self._reactiver_boutons()
+        self.barre_progression.set(1)
+        if rapport.tentees == 0:
+            texte = "Retraitement terminé — aucune parcelle en échec à retraiter."
+        elif rapport.termine:
+            self._output_path = chemin
+            self.bouton_ouvrir_dossier.configure(state="normal")
+            texte = (
+                f"Retraitement terminé — {rapport.reussies}/{rapport.tentees} parcelle(s) "
+                f"en échec corrigée(s), plus aucun échec restant. Fichier généré : {chemin}"
+            )
+        else:
+            self._output_path = chemin
+            self.bouton_ouvrir_dossier.configure(state="normal")
+            texte = (
+                f"Retraitement terminé — {rapport.reussies}/{rapport.tentees} parcelle(s) "
+                f"en échec corrigée(s), {rapport.restantes} encore en échec. Relancez ce "
+                f"bouton pour continuer. Fichier généré : {chemin}"
+            )
         self._ajouter_log(texte)
         self.label_statut.configure(text=texte)
         messagebox.showinfo(APP_TITLE, texte)

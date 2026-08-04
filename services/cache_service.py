@@ -150,6 +150,37 @@ class ProgressStore:
                 conn.execute("ALTER TABLE parcelles_sans_adresse ADD COLUMN cote TEXT")
             if "position_rue" not in colonnes:
                 conn.execute("ALTER TABLE parcelles_sans_adresse ADD COLUMN position_rue REAL")
+            # Une parcelle qui échoue en cours de traitement (voir
+            # main.py::_traiter_jusqu_a_objectif) n'est délibérément PAS
+            # enregistrée dans `parcelle_resultats` — c'est ce qui permet
+            # à la redécouverte normale de la reprendre automatiquement au
+            # prochain traitement, mélangée avec les parcelles jamais
+            # encore rencontrées. Cette table sert un besoin différent :
+            # pouvoir cibler et retraiter UNIQUEMENT les échecs (voir
+            # main.py::retraiter_echecs), sans devoir retraiter toute la
+            # commune pour les rattraper. Les champs stockés sont
+            # exactement ceux nécessaires pour reconstruire une `Parcelle`
+            # et refaire un rattachement cadastral complet (voir
+            # CadastreService.point_pour_identifiant, qui retrouve x/y à
+            # partir du seul `identifiant`).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS parcelles_echouees (
+                    commune TEXT NOT NULL,
+                    identifiant TEXT NOT NULL,
+                    pays TEXT NOT NULL,
+                    code_postal TEXT,
+                    rue TEXT NOT NULL,
+                    numero TEXT,
+                    adr_id TEXT,
+                    capakey TEXT,
+                    derniere_erreur TEXT,
+                    tentatives INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (commune, identifiant)
+                )
+                """
+            )
             conn.commit()
 
     def rue_deja_verifiee(self, commune: str, rue: str) -> bool:
@@ -219,6 +250,58 @@ class ProgressStore:
                 (cote, position_rue, commune, rue, capakey),
             )
             conn.commit()
+
+    def enregistrer_echec(self, commune: str, parcelle: Any, erreur: str) -> None:
+        """Enregistre (ou met à jour, en incrémentant `tentatives`) l'échec
+        d'une parcelle — voir main.py::_traiter_jusqu_a_objectif et
+        ::retraiter_echecs. `parcelle` : `models.parcelle.Parcelle` (pas
+        typé strictement ici pour éviter une dépendance circulaire)."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO parcelles_echouees "
+                "(commune, identifiant, pays, code_postal, rue, numero, adr_id, capakey, "
+                "derniere_erreur, tentatives, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(commune, identifiant) DO UPDATE SET "
+                "derniere_erreur = excluded.derniere_erreur, "
+                "tentatives = tentatives + 1, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (
+                    commune, parcelle.identifiant, parcelle.pays, parcelle.code_postal,
+                    parcelle.rue, parcelle.numero, parcelle.adr_id, parcelle.capakey, erreur,
+                ),
+            )
+            conn.commit()
+
+    def supprimer_echec(self, commune: str, identifiant: str) -> None:
+        """Retire une parcelle du suivi des échecs — dès qu'elle réussit,
+        que ce soit via le retraitement ciblé ou via le traitement normal
+        (une parcelle en échec reste redécouvrable normalement aussi, voir
+        `enregistrer_echec`)."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM parcelles_echouees WHERE commune = ? AND identifiant = ?",
+                (commune, identifiant),
+            )
+            conn.commit()
+
+    def echecs_commune(self, commune: str) -> List[Dict[str, Any]]:
+        """Toutes les parcelles actuellement en échec pour cette commune —
+        voir main.py::retraiter_echecs."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT identifiant, pays, code_postal, rue, numero, adr_id, capakey, "
+                "derniere_erreur, tentatives FROM parcelles_echouees WHERE commune = ?",
+                (commune,),
+            ).fetchall()
+        return [
+            {
+                "identifiant": identifiant, "pays": pays, "code_postal": code_postal,
+                "rue": rue, "numero": numero, "adr_id": adr_id, "capakey": capakey,
+                "derniere_erreur": derniere_erreur, "tentatives": tentatives,
+            }
+            for identifiant, pays, code_postal, rue, numero, adr_id, capakey, derniere_erreur, tentatives in rows
+        ]
 
     def get(self, commune: str, identifiant: str) -> Optional[dict]:
         with self._lock, self._connect() as conn:
