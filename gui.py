@@ -374,7 +374,7 @@ class App(ctk.CTk):
             client = ArcGISRestClient(
                 cache=cache_service, rate_limiter=rate_limiter, timeout=config.HTTP_TIMEOUT_SECONDS,
             )
-            cadastre_service = CadastreService(client)
+            cadastre_service = CadastreService(client, progress_store)
             layers_service = LayersService(client, config.LIENS_COMMUNAUX_PATH)
             excel_service = ExcelService(parametres["fichier_entree"])
 
@@ -444,7 +444,7 @@ class App(ctk.CTk):
                 cache=cache_service, rate_limiter=RateLimiter(config.MAX_REQUESTS_PER_SECOND),
                 timeout=config.HTTP_TIMEOUT_SECONDS,
             )
-            cadastre_service = CadastreService(client)
+            cadastre_service = CadastreService(client, progress_store)
             excel_service = ExcelService(chemin)
             wb = excel_service.load_output_workbook()
             ws = excel_service.get_active_sheet(wb)

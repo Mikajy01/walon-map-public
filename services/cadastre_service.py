@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import config
 from models.parcelle import Parcelle
+from services.cache_service import ProgressStore
 from services.geoportail_service import ArcGISRestClient
 from utils.logger import get_logger
 
@@ -60,8 +61,13 @@ def _point_dans_polygone(x: float, y: float, rings: Sequence[Sequence[Sequence[f
 
 
 class CadastreService:
-    def __init__(self, client: ArcGISRestClient) -> None:
+    def __init__(self, client: ArcGISRestClient, progress_store: Optional[ProgressStore] = None) -> None:
         self._client = client
+        # Optionnel (rétrocompatible) : sans lui, la découverte des
+        # parcelles sans adresse est refaite intégralement à chaque appel
+        # (voir _parcelles_cadastrales_sans_adresse) — utile pour un usage
+        # ponctuel, mais coûteux pour un traitement complet de commune.
+        self._progress_store = progress_store
 
     # -- Découverte des rues et adresses (ICAR) -----------------------------
 
@@ -170,7 +176,25 @@ class CadastreService:
         vérifié en conditions réelles : une boîte englobante simple sur
         Avenue Docteur Schweitzer (Colfontaine) trouvait 489 parcelles,
         contre 143 avec le tracé réel échantillonné — la différence est
-        purement des parcelles hors de la rue elle-même."""
+        purement des parcelles hors de la rue elle-même.
+
+        Si `self._progress_store` est fourni et que cette rue a déjà été
+        vérifiée lors d'un appel précédent (même une exécution antérieure,
+        persisté en base — voir ProgressStore.rue_deja_verifiee), le
+        résultat déjà connu est directement relu, sans jamais refaire
+        l'appel PICC + les requêtes CADMAP (~20-30s/rue, potentiellement
+        plusieurs dizaines de minutes pour une commune entière si refait à
+        chaque exécution — observé en conditions réelles)."""
+        if self._progress_store is not None and self._progress_store.rue_deja_verifiee(commune, rue):
+            return [
+                Parcelle(
+                    pays=pays, code_postal=p["code_postal"] or "/", commune=commune, rue=rue,
+                    numero="/", capakey=p["capakey"], numero_cadastral=p["numero_cadastral"],
+                    geometry=p["geometry"],
+                )
+                for p in self._progress_store.parcelles_sans_adresse(commune, rue)
+            ]
+
         troncons = self._client.query_layer(
             service_url=config.ARCGIS_SERVICES["PICC_VOIRIE"],
             layer_id=_PICC_VOIRIE_AXE_LAYER_ID,
@@ -179,6 +203,8 @@ class CadastreService:
             return_geometry=True,
         )
         if not troncons:
+            if self._progress_store is not None:
+                self._progress_store.enregistrer_parcelles_sans_adresse(commune, rue, [])
             return []
 
         points_echantillon: List[Tuple[float, float]] = []
@@ -231,6 +257,14 @@ class CadastreService:
             "%d parcelle(s) cadastrale(s) sans adresse trouvée(s) pour la rue '%s' (commune '%s').",
             len(nouvelles), rue, commune,
         )
+        if self._progress_store is not None:
+            self._progress_store.enregistrer_parcelles_sans_adresse(commune, rue, [
+                {
+                    "capakey": n.capakey, "numero_cadastral": n.numero_cadastral,
+                    "code_postal": n.code_postal, "geometry": n.geometry,
+                }
+                for n in nouvelles
+            ])
         return nouvelles
 
     @staticmethod

@@ -14,7 +14,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from utils.logger import get_logger
 
@@ -106,6 +106,90 @@ class ProgressStore:
                 )
                 """
             )
+            # Mémorise, par rue, la liste des parcelles cadastrales SANS
+            # adresse déjà découvertes (voir CadastreService::
+            # _parcelles_cadastrales_sans_adresse) — pas le cache HTTP brut
+            # (volontairement vidé avant de committer, voir le workflow
+            # GitHub Actions), mais le RÉSULTAT de cette découverte,
+            # beaucoup plus compact. Sans ça, cette découverte (PICC + une
+            # dizaine de requêtes CADMAP par rue, ~20-30s/rue) devrait être
+            # intégralement refaite à CHAQUE exécution — observé en
+            # conditions réelles : ~36 minutes rien que pour les 194 rues de
+            # Dour sur un cache neuf. `rues_verifiees` distingue "jamais
+            # vérifiée" de "vérifiée, aucune parcelle sans adresse trouvée"
+            # (liste vide légitime, à ne pas reverifier non plus).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rues_verifiees (
+                    commune TEXT NOT NULL,
+                    rue TEXT NOT NULL,
+                    PRIMARY KEY (commune, rue)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS parcelles_sans_adresse (
+                    commune TEXT NOT NULL,
+                    rue TEXT NOT NULL,
+                    capakey TEXT NOT NULL,
+                    numero_cadastral TEXT,
+                    code_postal TEXT,
+                    geometry TEXT,
+                    PRIMARY KEY (commune, rue, capakey)
+                )
+                """
+            )
+            conn.commit()
+
+    def rue_deja_verifiee(self, commune: str, rue: str) -> bool:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM rues_verifiees WHERE commune = ? AND rue = ?", (commune, rue),
+            ).fetchone()
+        return row is not None
+
+    def parcelles_sans_adresse(self, commune: str, rue: str) -> List[Dict[str, Any]]:
+        """Parcelles sans adresse déjà découvertes pour cette rue (voir
+        `rue_deja_verifiee` — à n'appeler que si True, sinon liste
+        trompeusement vide pour une rue jamais vérifiée)."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT capakey, numero_cadastral, code_postal, geometry "
+                "FROM parcelles_sans_adresse WHERE commune = ? AND rue = ?",
+                (commune, rue),
+            ).fetchall()
+        return [
+            {
+                "capakey": capakey,
+                "numero_cadastral": numero_cadastral,
+                "code_postal": code_postal,
+                "geometry": json.loads(geometry) if geometry else None,
+            }
+            for capakey, numero_cadastral, code_postal, geometry in rows
+        ]
+
+    def enregistrer_parcelles_sans_adresse(
+        self, commune: str, rue: str, parcelles: List[Dict[str, Any]],
+    ) -> None:
+        """Marque la rue comme vérifiée et enregistre les parcelles sans
+        adresse trouvées (liste vide acceptée : signifie qu'il n'y en a
+        réellement aucune sur cette rue, résultat à ne pas reperdre)."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO rues_verifiees (commune, rue) VALUES (?, ?)",
+                (commune, rue),
+            )
+            for p in parcelles:
+                conn.execute(
+                    "INSERT OR REPLACE INTO parcelles_sans_adresse "
+                    "(commune, rue, capakey, numero_cadastral, code_postal, geometry) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        commune, rue, p["capakey"], p.get("numero_cadastral"),
+                        p.get("code_postal"), json.dumps(p.get("geometry")),
+                    ),
+                )
             conn.commit()
 
     def get(self, commune: str, identifiant: str) -> Optional[dict]:

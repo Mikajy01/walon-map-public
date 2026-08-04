@@ -390,7 +390,7 @@ def main() -> int:
         timeout=config.HTTP_TIMEOUT_SECONDS,
         use_cache=not args.no_cache,
     )
-    cadastre_service = CadastreService(client)
+    cadastre_service = CadastreService(client, progress_store)
     layers_service = LayersService(client, config.LIENS_COMMUNAUX_PATH)
     excel_service = ExcelService(args.template or config.TEMPLATE_PATH)
 
