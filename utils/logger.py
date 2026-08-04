@@ -37,8 +37,24 @@ def setup_logging(logs_dir: Path, debug: bool = False) -> None:
     console.setLevel(level)
     root.addHandler(console)
 
+    # Repartir d'un fichier vide à chaque exécution plutôt que d'empiler sur
+    # les logs des exécutions précédentes. Utile pour déboguer la dernière
+    # exécution (l'usage réel qu'on en a fait jusqu'ici — voir l'historique
+    # du dépôt), inutile de conserver un historique illimité qui grossirait
+    # indéfiniment (observé : ~1,2 Mo pour seulement quelques exécutions de
+    # test) une fois commité à chaque exécution GitHub Actions.
+    #
+    # `RotatingFileHandler` ignore silencieusement `mode="w"` dès que
+    # `maxBytes > 0` (il impose 'a', nécessaire à sa propre logique de
+    # rotation par taille — vérifié : le fichier n'était PAS vidé avec
+    # mode="w" seul) : on tronque donc le fichier explicitement avant de
+    # construire le handler, qui repart alors bien de zéro. `backupCount=1`
+    # reste comme garde-fou si UNE SEULE exécution dépasse 10 Mo (peu
+    # probable : une commune entière ne génère que quelques centaines de Ko).
+    log_path = logs_dir / "walonmap.log"
+    log_path.write_text("", encoding="utf-8")
     file_handler = RotatingFileHandler(
-        logs_dir / "walonmap.log", maxBytes=10_000_000, backupCount=5, encoding="utf-8"
+        log_path, mode="a", maxBytes=10_000_000, backupCount=1, encoding="utf-8"
     )
     file_handler.setFormatter(fmt)
     file_handler.setLevel(logging.DEBUG)  # le fichier garde toujours le détail complet
