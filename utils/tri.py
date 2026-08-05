@@ -1,12 +1,23 @@
-"""Tri des lignes du fichier de sortie : par rue, puis par côté (toutes les
-parcelles d'un côté de la rue, dans l'ordre où on les croise en marchant,
-puis toutes celles de l'autre côté) — voir utils/geometrie.py.
+"""Tri des lignes du fichier de sortie : d'abord par code postal, puis par
+rue, puis par côté (toutes les parcelles d'un côté de la rue, dans l'ordre
+où on les croise en marchant, puis toutes celles de l'autre côté) — voir
+utils/geometrie.py.
 
-Demandé par le client à la place d'un tri par simple numéro : plus fidèle à
-une vérification manuelle sur le terrain, et fonctionne aussi bien pour les
-parcelles sans adresse (numéro = "/", conformes à la règle métier du
-document Word) que pour celles avec adresse, puisque le côté/la position
-sont calculés géométriquement, indépendamment du numéro pair/impair.
+Le tri par rue/côté est demandé par le client à la place d'un tri par
+simple numéro : plus fidèle à une vérification manuelle sur le terrain, et
+fonctionne aussi bien pour les parcelles sans adresse (numéro = "/",
+conformes à la règle métier du document Word) que pour celles avec
+adresse, puisque le côté/la position sont calculés géométriquement,
+indépendamment du numéro pair/impair.
+
+Le regroupement par code postal en premier sert les communes fusionnées
+couvrant plusieurs codes postaux (ex: Comines-Warneton, 7780-7784) : sans
+lui, les rues de codes postaux différents s'entremêlent dans l'ordre
+alphabétique (une rue "7780" entre deux rues "7781"), rendant impossible
+de vérifier un code postal à la fois même en les traitant un par un — le
+tri final ne reflétait jamais l'ordre de traitement. Ne change rien à
+l'intérieur d'un même code postal : le tri par rue/côté/position déjà
+demandé par le client y reste exactement identique.
 """
 
 from __future__ import annotations
@@ -42,8 +53,8 @@ def _cle_numero_cadastral(numero_cadastral: str) -> tuple:
 
 
 def cle_tri_parcelle(valeurs: Dict[str, str]) -> tuple:
-    """Clé de tri (rue, côté, position). `_cote`/`_position` (colonnes
-    internes, jamais écrites dans l'Excel — voir main.py::
+    """Clé de tri (code postal, rue, côté, position). `_cote`/`_position`
+    (colonnes internes, jamais écrites dans l'Excel — voir main.py::
     _set_identification_columns) ne sont disponibles que pour les
     parcelles traitées après l'ajout de ce calcul ; une ligne qui ne les a
     pas encore (à recalculer — voir main.py::recalculer_cote_position) est
@@ -51,6 +62,7 @@ def cle_tri_parcelle(valeurs: Dict[str, str]) -> tuple:
     elles comme avant. Toutes les clés renvoyées ont la même forme
     (comparable entre elles sans erreur de type), qu'une ligne ait ou non
     déjà son côté/position."""
+    code_postal = valeurs.get("B", "")
     rue = valeurs.get("D", "")
     cote = valeurs.get("_cote")
     position = valeurs.get("_position")
@@ -60,6 +72,7 @@ def cle_tri_parcelle(valeurs: Dict[str, str]) -> tuple:
     cle_cadastral = _cle_numero_cadastral(valeurs.get("F", "")) if not a_cote_position else (0, 0, 0, "", 0, "")
 
     return (
+        code_postal,
         rue,
         groupe,
         cote if cote is not None else "",

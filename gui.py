@@ -293,6 +293,7 @@ class App(ctk.CTk):
         self.barre_progression.set(ratio)
         libelles = {
             "découverte": "Découverte des adresses",
+            "redecouverte_rayon_elargi": "Redécouverte (rayon élargi)",
             "recalcul_côté_position": "Recalcul côté/position",
             "retraitement_echecs": "Retraitement des parcelles échouées",
             "nettoyage_adresse_ailleurs": "Nettoyage des doublons (adresse ailleurs)",

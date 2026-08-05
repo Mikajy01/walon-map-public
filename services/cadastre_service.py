@@ -20,7 +20,7 @@ import config
 from models.parcelle import Parcelle
 from services.cache_service import ProgressStore
 from services.geoportail_service import ArcGISRestClient
-from utils.geometrie import cote_et_position, construire_segments
+from utils.geometrie import cote_et_position, construire_segments, distance_min_polygone_rue
 from utils.logger import get_logger
 
 _logger = get_logger("services.cadastre_service")
@@ -30,14 +30,23 @@ _CADMAP_LAYER_ID = 0  # "Parcelles cadastrales"
 _PICC_VOIRIE_AXE_LAYER_ID = 21  # "Voirie - Axe" (tracé réel des rues)
 
 # Distance entre deux points échantillonnés le long du tracé d'une rue, et
-# marge de la fenêtre carrée interrogée sur CADMAP à chaque point. Choisis
-# pour que les fenêtres consécutives se recouvrent (marge >= la moitié du
+# rayon de la fenêtre carrée interrogée sur CADMAP à chaque point. Choisis
+# pour que les fenêtres consécutives se recouvrent (rayon >= la moitié du
 # pas) et ne laissent aucun trou le long de la rue, tout en limitant le
-# nombre de requêtes réseau (vérifié en conditions réelles sur Avenue
-# Docteur Schweitzer, Colfontaine : 154 points à 15m/20m contre une
-# vérité de référence à 143 parcelles trouvées).
-_PAS_ECHANTILLONNAGE_RUE_M = 30.0
-_MARGE_FENETRE_PARCELLES_M = 25.0
+# nombre de requêtes réseau. Rayon élargi à 200m (contre 25m à l'origine,
+# vérifié en conditions réelles sur Avenue Docteur Schweitzer, Colfontaine :
+# 154 points à 15m/20m contre une vérité de référence à 143 parcelles
+# trouvées) après avoir constaté sur le fichier de référence (Crisnée, Rue
+# Joseph Wauters) que certaines parcelles légitimement recensées par le
+# client sont à 45-176m du tracé — "deuxième rangée" derrière la première
+# ligne de bâtiments. Le pas d'échantillonnage est augmenté dans la même
+# proportion (même ratio rayon/pas qu'avant, 200/240 ≈ 25/30) pour ne pas
+# multiplier le nombre de requêtes en plus d'agrandir chacune d'elles.
+# Un rayon aussi large fait qu'une même parcelle peut tomber dans la
+# fenêtre de plusieurs rues à la fois : voir `rue_la_plus_proche`, qui
+# décide laquelle la garde réellement.
+_PAS_ECHANTILLONNAGE_RUE_M = 240.0
+_RAYON_RECHERCHE_PARCELLES_M = 200.0
 
 
 def _point_dans_polygone(x: float, y: float, rings: Sequence[Sequence[Sequence[float]]]) -> bool:
@@ -72,6 +81,17 @@ def _centre_polygone(rings: Sequence[Sequence[Sequence[float]]]) -> Optional[Tup
     return sum(xs) / len(xs), sum(ys) / len(ys)
 
 
+def _bbox_intersectent(
+    a: Tuple[float, float, float, float], b: Tuple[float, float, float, float],
+) -> bool:
+    """True si deux boîtes englobantes (xmin, ymin, xmax, ymax) se
+    chevauchent — pré-filtre bon marché utilisé par `rue_la_plus_proche`
+    avant le calcul de distance exact (coûteux)."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    return ax1 <= bx2 and ax2 >= bx1 and ay1 <= by2 and ay2 >= by1
+
+
 class CadastreService:
     def __init__(self, client: ArcGISRestClient, progress_store: Optional[ProgressStore] = None) -> None:
         self._client = client
@@ -87,6 +107,10 @@ class CadastreService:
         # cache HTTP après le premier appel, mais pas la reconstruction de
         # cette liste Python).
         self._adresses_commune_cache: Dict[str, List[Tuple[float, float]]] = {}
+        # Caches mémoire (voir _troncons_commune / _bbox_rues_commune),
+        # même raison que _adresses_commune_cache ci-dessus.
+        self._troncons_commune_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        self._bbox_rues_cache: Dict[str, Dict[str, Tuple[float, float, float, float]]] = {}
 
     def _adresses_commune(self, commune: str) -> List[Tuple[float, float]]:
         """Coordonnées de TOUTES les adresses ICAR de la commune, toutes
@@ -118,8 +142,92 @@ class CadastreService:
         rue) tombe dans ce polygone cadastral — voir `_adresses_commune`.
         Utilisé à la fois par la découverte (`_parcelles_cadastrales_sans_adresse`)
         et par le rattrapage qui nettoie les rues déjà vérifiées avant ce
-        changement (voir main.py::nettoyer_doublons_sans_adresse)."""
+        changement (voir main.py::recalculer_cote_position)."""
         return any(_point_dans_polygone(x, y, rings) for x, y in self._adresses_commune(commune))
+
+    def _troncons_commune(self, commune: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Tous les tronçons PICC de la commune, groupés par rue (RUE_NOM1)
+        — un seul appel réseau par commune (plus le cache HTTP habituel),
+        réutilisé par `rue_la_plus_proche` pour comparer une parcelle
+        candidate à toutes les rues proches sans requête PICC
+        supplémentaire par comparaison. `order_by="OBJECTID"` : même
+        correctif de pagination instable que `lister_rues`/
+        `_adresses_commune` — une commune entière a potentiellement
+        plusieurs milliers de segments, largement au-delà d'une page."""
+        if commune not in self._troncons_commune_cache:
+            features = self._client.query_layer(
+                service_url=config.ARCGIS_SERVICES["PICC_VOIRIE"],
+                layer_id=_PICC_VOIRIE_AXE_LAYER_ID,
+                where=f"COMMU_NOM1 = '{self._escape(commune)}'",
+                out_fields="OBJECTID,RUE_NOM1",
+                return_geometry=True,
+                order_by="OBJECTID",
+            )
+            par_rue: Dict[str, List[Dict[str, Any]]] = {}
+            for feature in features:
+                rue = feature["attributes"].get("RUE_NOM1")
+                if rue:
+                    par_rue.setdefault(rue, []).append(feature)
+            self._troncons_commune_cache[commune] = par_rue
+        return self._troncons_commune_cache[commune]
+
+    def _bbox_rues_commune(self, commune: str) -> Dict[str, Tuple[float, float, float, float]]:
+        """Boîte englobante (xmin, ymin, xmax, ymax) du tracé de chaque rue
+        de la commune — pré-filtre bon marché pour `rue_la_plus_proche`, qui
+        ne calcule la distance exacte (coûteuse : O(côtés × segments)) qu'aux
+        rues dont la boîte passe à proximité d'une parcelle candidate, pas
+        aux ~200 rues d'une commune à chaque comparaison."""
+        if commune not in self._bbox_rues_cache:
+            bboxes: Dict[str, Tuple[float, float, float, float]] = {}
+            for rue, troncons in self._troncons_commune(commune).items():
+                xs: List[float] = []
+                ys: List[float] = []
+                for troncon in troncons:
+                    for chemin in (troncon.get("geometry") or {}).get("paths", []):
+                        for x, y in chemin:
+                            xs.append(x)
+                            ys.append(y)
+                if xs:
+                    bboxes[rue] = (min(xs), min(ys), max(xs), max(ys))
+            self._bbox_rues_cache[commune] = bboxes
+        return self._bbox_rues_cache[commune]
+
+    def rue_la_plus_proche(
+        self, commune: str, rue_actuelle: str, rings: Sequence[Sequence[Sequence[float]]],
+    ) -> bool:
+        """True si `rue_actuelle` est bien la rue dont le tracé est le plus
+        proche de ce polygone cadastral, parmi toutes les rues de la
+        commune dont le tracé passe à proximité (voir `_troncons_commune`
+        et `utils/geometrie.py::distance_min_polygone_rue`).
+
+        Nécessaire depuis l'élargissement du rayon de recherche à 200m
+        (voir `_RAYON_RECHERCHE_PARCELLES_M`) : une parcelle peut désormais
+        tomber dans la fenêtre de recherche de plusieurs rues à la fois —
+        elle ne doit être retenue que par celle dont le tracé est
+        réellement le plus proche (sinon même souci que la parcelle
+        91P3/91S2, déjà corrigé pour le cas « adresse ailleurs » — ici pour
+        le cas « une autre rue est plus proche »)."""
+        troncons_par_rue = self._troncons_commune(commune)
+        distance_actuelle = distance_min_polygone_rue(
+            rings, construire_segments(troncons_par_rue.get(rue_actuelle, [])),
+        )
+        if distance_actuelle is None:
+            return False
+
+        xs = [pt[0] for ring in rings for pt in ring]
+        ys = [pt[1] for ring in rings for pt in ring]
+        if not xs:
+            return True
+        marge = _RAYON_RECHERCHE_PARCELLES_M
+        bbox_parcelle = (min(xs) - marge, min(ys) - marge, max(xs) + marge, max(ys) + marge)
+
+        for rue, bbox_rue in self._bbox_rues_commune(commune).items():
+            if rue == rue_actuelle or not _bbox_intersectent(bbox_parcelle, bbox_rue):
+                continue
+            distance = distance_min_polygone_rue(rings, construire_segments(troncons_par_rue[rue]))
+            if distance is not None and distance < distance_actuelle:
+                return False
+        return True
 
     # -- Découverte des rues et adresses (ICAR) -----------------------------
 
@@ -148,7 +256,7 @@ class CadastreService:
         return rues
 
     def lister_parcelles(
-        self, pays: str, commune: str, rue: str, codes_postaux: Optional[List[str]] = None,
+        self, pays: str, commune: str, rue: str, codes_postaux: Optional[List[str]] = None, force: bool = False,
     ) -> List[Parcelle]:
         """Construit une `Parcelle` par entrée ICAR de la rue, PUIS complète
         avec les parcelles cadastrales qui bordent la rue mais n'ont pas
@@ -217,7 +325,7 @@ class CadastreService:
             if codes_rue and not (codes_rue & set(codes_postaux)):
                 return parcelles
 
-        sans_adresse = self._parcelles_cadastrales_sans_adresse(pays, commune, rue, parcelles)
+        sans_adresse = self._parcelles_cadastrales_sans_adresse(pays, commune, rue, parcelles, force=force)
 
         # Côté ("G"/"D") et position le long de la rue (voir
         # utils/geometrie.py) — calculés pour les parcelles AVEC adresse ici
@@ -300,7 +408,7 @@ class CadastreService:
     # -- Parcelles cadastrales sans adresse (complétion CADMAP + PICC) ------
 
     def _parcelles_cadastrales_sans_adresse(
-        self, pays: str, commune: str, rue: str, parcelles_icar: List[Parcelle],
+        self, pays: str, commune: str, rue: str, parcelles_icar: List[Parcelle], force: bool = False,
     ) -> List[Parcelle]:
         """Parcelles CADMAP bordant la rue (tracé réel, couche PICC "Voirie -
         Axe") qui ne correspondent à AUCUNE adresse ICAR déjà connue de
@@ -322,8 +430,19 @@ class CadastreService:
         résultat déjà connu est directement relu, sans jamais refaire
         l'appel PICC + les requêtes CADMAP (~20-30s/rue, potentiellement
         plusieurs dizaines de minutes pour une commune entière si refait à
-        chaque exécution — observé en conditions réelles)."""
-        if self._progress_store is not None and self._progress_store.rue_deja_verifiee(commune, rue):
+        chaque exécution — observé en conditions réelles).
+
+        `force=True` (voir main.py::recalculer_cote_position, rattrapage
+        dédié) ignore ce raccourci et refait la découverte même pour une
+        rue déjà vérifiée — utilisé pour redécouvrir avec le rayon élargi
+        (`_RAYON_RECHERCHE_PARCELLES_M`) les rues vérifiées avant cet
+        élargissement. Les nouvelles parcelles trouvées sont fusionnées
+        avec le cache existant (`enregistrer_parcelles_sans_adresse` fait
+        un INSERT OR REPLACE par parcelle, jamais une purge) ; les entrées
+        qui ne devraient plus y figurer (adresse ailleurs trouvée entre
+        temps, rue plus proche identifiée) sont nettoyées séparément par
+        les phases dédiées du même rattrapage, pas ici."""
+        if not force and self._progress_store is not None and self._progress_store.rue_deja_verifiee(commune, rue):
             return [
                 Parcelle(
                     pays=pays, code_postal=p["code_postal"] or "/", commune=commune, rue=rue,
@@ -337,6 +456,7 @@ class CadastreService:
         if not troncons:
             if self._progress_store is not None:
                 self._progress_store.enregistrer_parcelles_sans_adresse(commune, rue, [])
+                self._progress_store.marquer_rue_redecouverte_rayon_elargi(commune, rue)
             return []
 
         points_echantillon: List[Tuple[float, float]] = []
@@ -346,7 +466,7 @@ class CadastreService:
 
         capakeys_vus: Dict[str, Dict[str, Any]] = {}
         for x, y in points_echantillon:
-            marge = _MARGE_FENETRE_PARCELLES_M
+            marge = _RAYON_RECHERCHE_PARCELLES_M
             enveloppe = {
                 "rings": [[
                     [x - marge, y - marge], [x + marge, y - marge],
@@ -374,6 +494,8 @@ class CadastreService:
             rings = (feature.get("geometry") or {}).get("rings", [])
             if self.a_une_adresse_ailleurs(commune, rings):
                 continue  # a déjà une adresse ICAR quelque part dans la commune
+            if not self.rue_la_plus_proche(commune, rue, rings):
+                continue  # une autre rue de la commune est plus proche, ce sera pour elle
             attrs = feature["attributes"]
             parcelle = Parcelle(
                 pays=pays,
@@ -404,6 +526,13 @@ class CadastreService:
                 }
                 for n in nouvelles
             ])
+            # Marque cette rue comme découverte sous le rayon ACTUEL (voir
+            # _RAYON_RECHERCHE_PARCELLES_M) — que ce soit sa toute première
+            # découverte ou une redécouverte forcée (`force=True`, voir
+            # main.py::recalculer_cote_position) : dans les deux cas, elle
+            # n'a plus besoin d'être redécouverte tant que le rayon ne
+            # change pas à nouveau.
+            self._progress_store.marquer_rue_redecouverte_rayon_elargi(commune, rue)
         return nouvelles
 
     @staticmethod

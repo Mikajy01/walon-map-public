@@ -181,6 +181,25 @@ class ProgressStore:
                 )
                 """
             )
+            # Marque les rues déjà redécouvertes avec le rayon de recherche
+            # élargi (voir CadastreService._RAYON_RECHERCHE_PARCELLES_M et
+            # main.py::recalculer_cote_position, phase 1) — sans cette
+            # table, cette phase (coûteuse : ~2 min/rue observé en
+            # conditions réelles) referait le même travail à chaque
+            # relance du rattrapage sur une commune déjà redécouverte,
+            # pour ne jamais rien trouver de nouveau. `rues_verifiees`
+            # existant ne peut pas servir à ça : il marque "a déjà été
+            # découverte" (avec n'importe quel rayon, y compris l'ancien),
+            # pas spécifiquement "sous le rayon élargi".
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rues_redecouvertes_rayon_elargi (
+                    commune TEXT NOT NULL,
+                    rue TEXT NOT NULL,
+                    PRIMARY KEY (commune, rue)
+                )
+                """
+            )
             conn.commit()
 
     def rue_deja_verifiee(self, commune: str, rue: str) -> bool:
@@ -193,13 +212,33 @@ class ProgressStore:
     def rues_verifiees_commune(self, commune: str) -> List[str]:
         """Toutes les rues déjà vérifiées pour une commune — sert au
         rattrapage qui reparcourt les parcelles sans adresse déjà mises en
-        cache pour en retirer celles qui ont en réalité une adresse sur une
-        autre rue (voir main.py::nettoyer_doublons_sans_adresse)."""
+        cache (voir main.py::recalculer_cote_position)."""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT rue FROM rues_verifiees WHERE commune = ?", (commune,),
             ).fetchall()
         return [rue for (rue,) in rows]
+
+    def rue_redecouverte_rayon_elargi(self, commune: str, rue: str) -> bool:
+        """True si cette rue a déjà été redécouverte avec le rayon de
+        recherche élargi (voir main.py::recalculer_cote_position, phase 1)
+        — évite de refaire ce travail coûteux (~2 min/rue observé en
+        conditions réelles) à chaque relance du rattrapage sur une commune
+        déjà redécouverte."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM rues_redecouvertes_rayon_elargi WHERE commune = ? AND rue = ?",
+                (commune, rue),
+            ).fetchone()
+        return row is not None
+
+    def marquer_rue_redecouverte_rayon_elargi(self, commune: str, rue: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO rues_redecouvertes_rayon_elargi (commune, rue) VALUES (?, ?)",
+                (commune, rue),
+            )
+            conn.commit()
 
     def supprimer_parcelle_sans_adresse(self, commune: str, rue: str, capakey: str) -> None:
         """Retire une parcelle du cache de découverte 'sans adresse' — sert
