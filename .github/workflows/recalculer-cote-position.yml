@@ -21,6 +21,11 @@ on:
         description: "Commune à rattraper"
         required: true
         type: string
+      code_postal:
+        description: "Code(s) postal(aux) à filtrer, séparés par une virgule (vide = toute la commune) — indispensable pour une commune fusionnée dont on ne gère qu'un sous-ensemble des codes postaux (ex: Comines-Warneton), sans quoi le rattrapage touche toute la commune"
+        required: false
+        default: ""
+        type: string
       rate_limit:
         description: "Requêtes par seconde vers le Géoportail"
         required: false
@@ -81,6 +86,15 @@ jobs:
                 --cache-dir "donnees/cache/${{ inputs.commune }}"
                 --logs-dir "donnees/logs/${{ inputs.commune }}"
                 --output-dir "donnees/output")
+          if [ -n "${{ inputs.code_postal }}" ]; then
+            IFS=',' read -ra CODES <<< "${{ inputs.code_postal }}"
+            for code in "${CODES[@]}"; do
+              code_trim="$(echo "$code" | xargs)"
+              if [ -n "$code_trim" ]; then
+                ARGS+=(--code-postal "$code_trim")
+              fi
+            done
+          fi
           if [ "${{ inputs.debug }}" = "true" ]; then
             ARGS+=(--debug)
           fi

@@ -154,8 +154,10 @@ def parse_args() -> argparse.Namespace:
              "la fois ne garde que la plus proche géométriquement (voir "
              "main.py::recalculer_cote_position). À lancer une fois par "
              "commune (ex: workflow GitHub Actions dédié) — les parcelles "
-             "traitées normalement n'ont déjà plus ces problèmes, --limit et "
-             "--code-postal sont ignorés dans ce mode.",
+             "traitées normalement n'ont déjà plus ces problèmes. --limit est "
+             "ignoré dans ce mode ; --code-postal, lui, est respecté (utile "
+             "pour une commune fusionnée dont on ne gère qu'un sous-ensemble "
+             "des codes postaux, ex: Comines-Warneton).",
     )
     parser.add_argument(
         "--retraiter-echecs", action="store_true",
@@ -516,6 +518,7 @@ def recalculer_cote_position(
     progress_store: ProgressStore,
     excel_service: ExcelService,
     output_path: Optional[Path] = None,
+    codes_postaux: Optional[List[str]] = None,
     on_progress: Optional[ProgressCallback] = None,
 ) -> int:
     """Rattrapage géométrique unique, à lancer une fois par commune, qui
@@ -554,7 +557,18 @@ def recalculer_cote_position(
     Les parcelles traitées normalement (`traiter_commune`) depuis l'ajout
     de ces vérifications n'ont déjà plus ces problèmes ; relancer ceci ne
     fait rien. Renvoie le nombre total de corrections effectuées (0 si la
-    commune n'a rien à rattraper)."""
+    commune n'a rien à rattraper).
+
+    `codes_postaux`, si fourni, restreint les quatre étapes aux rues/
+    parcelles de ces codes postaux — indispensable pour une commune
+    fusionnée dont chaque collaborateur ne gère qu'un sous-ensemble des
+    codes postaux (ex: Comines-Warneton, 7780-7784) : sans ce filtre, le
+    rattrapage redécouvre et modifie TOUTE la commune, y compris des rues
+    de codes postaux dont le collaborateur qui l'a lancé n'est pas
+    responsable (incident réel constaté : collaboratrice en charge de
+    Courcelles/6180 uniquement, correction remontée jusqu'à 6183). Une
+    rue/parcelle dont le code postal n'est pas encore connu (jamais
+    résolue) n'est par prudence jamais sautée, comme dans `traiter_commune`."""
     total_corrections = 0
     segments_par_rue: Dict[str, list] = {}
 
@@ -577,7 +591,7 @@ def recalculer_cote_position(
         if on_progress:
             on_progress("redecouverte_rayon_elargi", rue_index + 1, len(rues_a_redecouvrir))
         avant = {e["capakey"] for e in progress_store.parcelles_sans_adresse(commune, rue)}
-        cadastre_service.lister_parcelles("Belgique", commune, rue, force=True)
+        cadastre_service.lister_parcelles("Belgique", commune, rue, codes_postaux=codes_postaux, force=True)
         nouvelles_capakeys = {
             e["capakey"] for e in progress_store.parcelles_sans_adresse(commune, rue)
         } - avant
@@ -595,6 +609,8 @@ def recalculer_cote_position(
     base = progress_store.all_for_commune(commune)
     a_corriger_cote_position: Dict[str, list] = {}
     for identifiant, valeurs in base.items():
+        if codes_postaux is not None and valeurs.get("B") not in codes_postaux:
+            continue
         if "_cote" not in valeurs or "_position" not in valeurs:
             a_corriger_cote_position.setdefault(valeurs.get("D", ""), []).append((identifiant, valeurs))
 
@@ -637,6 +653,8 @@ def recalculer_cote_position(
         if on_progress:
             on_progress("nettoyage_adresse_ailleurs", rue_index + 1, len(rues_verifiees))
         for entree in progress_store.parcelles_sans_adresse(commune, rue):
+            if codes_postaux is not None and entree.get("code_postal") not in codes_postaux:
+                continue
             rings = (entree.get("geometry") or {}).get("rings", [])
             if not rings or not cadastre_service.a_une_adresse_ailleurs(commune, rings):
                 continue
@@ -656,6 +674,8 @@ def recalculer_cote_position(
     rues_candidates_par_capakey: Dict[str, list] = {}
     for rue in progress_store.rues_verifiees_commune(commune):
         for entree in progress_store.parcelles_sans_adresse(commune, rue):
+            if codes_postaux is not None and entree.get("code_postal") not in codes_postaux:
+                continue
             rues_candidates_par_capakey.setdefault(entree["capakey"], []).append(rue)
 
     doublons = {capakey: rues for capakey, rues in rues_candidates_par_capakey.items() if len(rues) > 1}
@@ -800,7 +820,10 @@ def main() -> int:
         try:
             output_path = (args.output_dir / f"{commune}.xlsx") if args.output_dir else None
             if args.recalculer_cote_position:
-                recalculer_cote_position(commune, cadastre_service, progress_store, excel_service, output_path=output_path)
+                recalculer_cote_position(
+                    commune, cadastre_service, progress_store, excel_service,
+                    output_path=output_path, codes_postaux=args.codes_postaux,
+                )
                 recalcul_reussi = True
                 continue
             if args.retraiter_echecs:

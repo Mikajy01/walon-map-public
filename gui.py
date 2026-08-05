@@ -496,12 +496,19 @@ class App(ctk.CTk):
 
     def _recalculer_cote_position(self) -> None:
         """Rattrapage géométrique à lancer une fois par commune — voir
-        main.py::recalculer_cote_position pour le détail des 3 corrections
+        main.py::recalculer_cote_position pour le détail des corrections
         appliquées en une passe (côté/position manquants, doublons "sans
         adresse" ayant une adresse ailleurs, doublons "sans adresse"
-        candidats sur plusieurs rues à la fois). Les parcelles traitées via
-        « Démarrer le traitement » depuis l'ajout de ces vérifications
-        n'ont déjà plus ces problèmes, inutile de relancer ceci après."""
+        candidats sur plusieurs rues à la fois, redécouverte au rayon
+        élargi). Les parcelles traitées via « Démarrer le traitement »
+        depuis l'ajout de ces vérifications n'ont déjà plus ces problèmes,
+        inutile de relancer ceci après.
+
+        Réutilise le champ Code(s) postal(aux) du formulaire principal :
+        vide = toute la commune, sinon restreint le rattrapage à ces codes
+        postaux — à renseigner pour une commune fusionnée dont on ne gère
+        qu'un sous-ensemble des codes postaux, sans quoi le rattrapage peut
+        toucher des rues d'un code postal dont on n'est pas responsable."""
         if self._en_cours:
             return
         commune = self.entry_commune.get().strip()
@@ -535,17 +542,25 @@ class App(ctk.CTk):
 
         thread = threading.Thread(
             target=self._executer_recalcul_cote_position,
-            args=(commune, Path(fichier_entree), Path(fichier_sortie), self.slider_vitesse.get()),
+            args=(
+                commune, Path(fichier_entree), Path(fichier_sortie), self.slider_vitesse.get(),
+                _parse_codes_postaux(self.entry_codes_postaux.get()),
+            ),
             daemon=True,
         )
         thread.start()
 
     def _executer_recalcul_cote_position(
         self, commune: str, fichier_entree: Path, fichier_sortie: Path, rate_limit: float,
+        codes_postaux: Optional[list] = None,
     ) -> None:
         """Tourne dans un thread d'arrière-plan, comme `_executer` : voir
         main.py::recalculer_cote_position pour la logique elle-même
-        (aucune duplication ici)."""
+        (aucune duplication ici). `codes_postaux` (même champ que le
+        traitement normal) restreint le rattrapage à ces codes postaux —
+        indispensable pour une commune fusionnée dont on ne gère qu'un
+        sous-ensemble des codes postaux (ex: Comines-Warneton), sans quoi
+        le rattrapage touche toute la commune (incident réel constaté)."""
         try:
             cache_service = CacheService(config.CACHE_DIR)
             progress_store = ProgressStore(config.CACHE_DIR)
@@ -560,7 +575,7 @@ class App(ctk.CTk):
 
             n = recalculer_cote_position(
                 commune, cadastre_service, progress_store, excel_service,
-                output_path=fichier_sortie, on_progress=on_progress,
+                output_path=fichier_sortie, codes_postaux=codes_postaux, on_progress=on_progress,
             )
             self._message_queue.put(("recalcul_done", n, fichier_sortie))
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
