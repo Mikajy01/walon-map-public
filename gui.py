@@ -35,7 +35,14 @@ if sys.stderr is None:
 import customtkinter as ctk
 
 import config
-from main import RapportEchecs, ResultatTraitement, recalculer_cote_position, retraiter_echecs, traiter_commune
+from main import (
+    RapportEchecs,
+    ResultatTraitement,
+    recalculer_cote_position,
+    retraiter_echecs,
+    supprimer_parcelles_hors_codes_postaux,
+    traiter_commune,
+)
 from services.cache_service import CacheService, ProgressStore
 from services.cadastre_service import CadastreService
 from services.excel_service import ExcelService
@@ -204,6 +211,24 @@ class App(ctk.CTk):
             command=self._retraiter_echecs,
         )
         self.bouton_retraiter_echecs.pack(side="left", padx=(8, 0))
+
+        # -- Action destructive, isolée sur sa propre ligne + couleur
+        # d'avertissement pour ne jamais être cliquée par réflexe à côté
+        # des boutons normaux ci-dessus (voir _supprimer_hors_code_postal :
+        # double confirmation avant toute suppression réelle).
+        danger = ctk.CTkFrame(self, fg_color="transparent")
+        danger.pack(fill="x", padx=16, pady=(6, 0))
+        self.bouton_supprimer_hors_code_postal = ctk.CTkButton(
+            danger, text="Supprimer les lignes hors code(s) postal(aux)…", height=36,
+            fg_color="#8B0000", hover_color="#B22222",
+            command=self._supprimer_hors_code_postal,
+        )
+        self.bouton_supprimer_hors_code_postal.pack(side="left")
+        ctk.CTkLabel(
+            danger,
+            text="Suppression définitive — nécessite le champ Code(s) postal(aux) rempli (les codes à CONSERVER).",
+            text_color=("gray30", "gray70"), font=ctk.CTkFont(size=11),
+        ).pack(side="left", padx=(8, 0))
 
         self.label_statut = ctk.CTkLabel(self, text="Prêt.", anchor="w")
         self.label_statut.pack(fill="x", padx=16, pady=(10, 2))
@@ -375,6 +400,7 @@ class App(ctk.CTk):
         self.bouton_importer_corrige.configure(state="disabled")
         self.bouton_recalculer_cote_position.configure(state="disabled")
         self.bouton_retraiter_echecs.configure(state="disabled")
+        self.bouton_supprimer_hors_code_postal.configure(state="disabled")
         self.bouton_ouvrir_dossier.configure(state="disabled")
         self.barre_progression.set(0)
         self.label_statut.configure(text="Démarrage…")
@@ -443,6 +469,7 @@ class App(ctk.CTk):
         self.bouton_importer_corrige.configure(state="disabled", text="Importation en cours…")
         self.bouton_recalculer_cote_position.configure(state="disabled")
         self.bouton_retraiter_echecs.configure(state="disabled")
+        self.bouton_supprimer_hors_code_postal.configure(state="disabled")
         self.bouton_ouvrir_dossier.configure(state="disabled")
         self.barre_progression.set(0)
         self.label_statut.configure(text="Importation et synchronisation en cours…")
@@ -533,6 +560,7 @@ class App(ctk.CTk):
         self.bouton_importer_corrige.configure(state="disabled")
         self.bouton_recalculer_cote_position.configure(state="disabled", text="Recalcul en cours…")
         self.bouton_retraiter_echecs.configure(state="disabled")
+        self.bouton_supprimer_hors_code_postal.configure(state="disabled")
         self.bouton_ouvrir_dossier.configure(state="disabled")
         self.barre_progression.set(0)
         self.label_statut.configure(text="Recalcul côté/position en cours…")
@@ -614,6 +642,7 @@ class App(ctk.CTk):
         self.bouton_importer_corrige.configure(state="disabled")
         self.bouton_recalculer_cote_position.configure(state="disabled")
         self.bouton_retraiter_echecs.configure(state="disabled", text="Retraitement en cours…")
+        self.bouton_supprimer_hors_code_postal.configure(state="disabled")
         self.bouton_ouvrir_dossier.configure(state="disabled")
         self.barre_progression.set(0)
         self.label_statut.configure(text="Retraitement des parcelles échouées en cours…")
@@ -656,12 +685,119 @@ class App(ctk.CTk):
             logging.getLogger("gui").exception("Échec du retraitement des parcelles échouées")
             self._message_queue.put(("error", str(exc)))
 
+    # -- Suppression définitive des lignes hors code(s) postal(aux) ---------
+
+    def _supprimer_hors_code_postal(self) -> None:
+        """Nettoyage définitif pour une commune touchée par un rattrapage
+        lancé sans filtre de code postal avant que `recalculer_cote_position`
+        le respecte (voir main.py::supprimer_parcelles_hors_codes_postaux —
+        incident réel : Courcelles, collaboratrice en charge du seul 6180,
+        lignes jusqu'à 6183 remontées après coup).
+
+        Purement local (aucun appel réseau : uniquement la base de
+        progression déjà en cache) donc exécuté directement sur le fil
+        principal, sans thread d'arrière-plan — mais protégé par une double
+        confirmation vu le caractère irréversible : un aperçu du nombre de
+        lignes concernées, puis la saisie exacte du nom de la commune avant
+        toute suppression réelle. Le champ Code(s) postal(aux) est ici
+        obligatoire (contrairement aux autres boutons) et se lit comme
+        « codes à CONSERVER » — le laisser vide supprimerait toute la
+        commune, jamais autorisé."""
+        if self._en_cours:
+            return
+        commune = self.entry_commune.get().strip()
+        codes_postaux = _parse_codes_postaux(self.entry_codes_postaux.get())
+        fichier_entree = self.entry_fichier_entree.get().strip()
+        fichier_sortie = self.entry_fichier_sortie.get().strip()
+        if not commune:
+            messagebox.showerror(APP_TITLE, "Le champ Commune est obligatoire.")
+            return
+        if not codes_postaux:
+            messagebox.showerror(
+                APP_TITLE,
+                "Le champ Code(s) postal(aux) est OBLIGATOIRE pour cette action — indique "
+                "le ou les codes postaux à CONSERVER, tout le reste sera supprimé "
+                "définitivement. Le laisser vide supprimerait toute la commune.",
+            )
+            return
+        if not fichier_entree or not Path(fichier_entree).is_file():
+            messagebox.showerror(
+                APP_TITLE, "Choisissez un fichier Excel gabarit valide (sert à réécrire le fichier de sortie).",
+            )
+            return
+        if not fichier_sortie:
+            messagebox.showerror(APP_TITLE, "Choisissez où enregistrer le fichier de sortie.")
+            return
+        if not self._verifier_licence(commune):
+            return
+
+        progress_store = ProgressStore(config.CACHE_DIR)
+        identifiants = progress_store.identifiants_hors_codes_postaux(commune, codes_postaux)
+        if not identifiants:
+            messagebox.showinfo(
+                APP_TITLE,
+                f"Aucune ligne à supprimer — toutes les parcelles déjà résolues de "
+                f"« {commune} » ont déjà un code postal dans {codes_postaux}.",
+            )
+            return
+
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"ATTENTION — action irréversible.\n\n"
+            f"{len(identifiants)} ligne(s) de « {commune} » ont un code postal HORS de "
+            f"{codes_postaux} et seront SUPPRIMÉES DÉFINITIVEMENT de la base de progression.\n\n"
+            f"Continuer ?",
+            icon="warning",
+        ):
+            return
+
+        confirmation = simpledialog.askstring(
+            APP_TITLE,
+            f"Pour confirmer la suppression définitive de {len(identifiants)} ligne(s), "
+            f"tape exactement le nom de la commune :\n{commune}",
+            parent=self,
+        )
+        if confirmation != commune:
+            messagebox.showinfo(APP_TITLE, "Confirmation incorrecte ou annulée — rien n'a été supprimé.")
+            return
+
+        self._en_cours = True
+        self.bouton_lancer.configure(state="disabled")
+        self.bouton_importer_corrige.configure(state="disabled")
+        self.bouton_recalculer_cote_position.configure(state="disabled")
+        self.bouton_retraiter_echecs.configure(state="disabled")
+        self.bouton_supprimer_hors_code_postal.configure(state="disabled", text="Suppression en cours…")
+        self.bouton_ouvrir_dossier.configure(state="disabled")
+        self.label_statut.configure(text="Suppression définitive en cours…")
+
+        try:
+            excel_service = ExcelService(Path(fichier_entree))
+            n = supprimer_parcelles_hors_codes_postaux(
+                commune, codes_postaux, progress_store, excel_service, output_path=Path(fichier_sortie),
+            )
+        except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
+            logging.getLogger("gui").exception("Échec de la suppression hors code(s) postal(aux)")
+            self._reactiver_boutons()
+            messagebox.showerror(APP_TITLE, f"La suppression a échoué :\n{exc}")
+            return
+
+        self._reactiver_boutons()
+        self._output_path = Path(fichier_sortie)
+        self.bouton_ouvrir_dossier.configure(state="normal")
+        texte = f"{n} ligne(s) supprimée(s) définitivement. Fichier régénéré : {fichier_sortie}"
+        self._ajouter_log(texte)
+        self.label_statut.configure(text=texte)
+        messagebox.showinfo(APP_TITLE, texte)
+
     def _reactiver_boutons(self) -> None:
         self._en_cours = False
         self.bouton_lancer.configure(state="normal", text="Démarrer le traitement")
         self.bouton_importer_corrige.configure(state="normal", text="Importer un Excel corrigé…")
         self.bouton_recalculer_cote_position.configure(state="normal", text="Recalculer côté/position et doublons…")
         self.bouton_retraiter_echecs.configure(state="normal", text="Retraiter les parcelles échouées…")
+        self.bouton_supprimer_hors_code_postal.configure(
+            state="normal", text="Supprimer les lignes hors code(s) postal(aux)…",
+        )
 
     def _fin_traitement(
         self, succes: bool, resultat: Optional[ResultatTraitement] = None, erreur: Optional[str] = None,

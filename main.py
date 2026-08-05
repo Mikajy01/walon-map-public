@@ -793,6 +793,47 @@ def retraiter_echecs(
     return RapportEchecs(tentees=total, reussies=reussies, restantes=restantes)
 
 
+def supprimer_parcelles_hors_codes_postaux(
+    commune: str,
+    codes_postaux_autorises: List[str],
+    progress_store: ProgressStore,
+    excel_service: ExcelService,
+    output_path: Optional[Path] = None,
+) -> int:
+    """Supprime DÉFINITIVEMENT les parcelles déjà résolues de cette commune
+    dont le code postal n'est PAS dans `codes_postaux_autorises`, ainsi que
+    les entrées correspondantes du cache de découverte "sans adresse" (sans
+    ça, une future exécution non filtrée les retrouverait telles quelles
+    via ce cache et les résoudrait de nouveau).
+
+    Nettoyage pour les communes déjà touchées par un rattrapage lancé sans
+    filtre de code postal AVANT que `recalculer_cote_position` respecte
+    `codes_postaux` (incident réel : Courcelles, collaboratrice en charge
+    du seul 6180, lignes jusqu'à 6183 remontées après coup).
+
+    Action destructive et irréversible (hors historique Git du dépôt de
+    données) : voir gui.py::_supprimer_hors_code_postal pour les
+    confirmations demandées avant d'appeler ceci — cette fonction elle-même
+    ne demande AUCUNE confirmation, elle exécute immédiatement. Renvoie le
+    nombre de lignes réellement supprimées de `parcelle_resultats`."""
+    identifiants = progress_store.identifiants_hors_codes_postaux(commune, codes_postaux_autorises)
+    for identifiant in identifiants:
+        progress_store.supprimer_resultat(commune, identifiant)
+
+    for rue in progress_store.rues_verifiees_commune(commune):
+        for entree in progress_store.parcelles_sans_adresse(commune, rue):
+            if entree.get("code_postal") and entree["code_postal"] not in codes_postaux_autorises:
+                progress_store.supprimer_parcelle_sans_adresse(commune, rue, entree["capakey"])
+
+    if identifiants:
+        _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
+        _logger.warning(
+            "Commune '%s' : %d ligne(s) supprimée(s) définitivement (code postal hors de %s).",
+            commune, len(identifiants), codes_postaux_autorises,
+        )
+    return len(identifiants)
+
+
 def main() -> int:
     args = parse_args()
     config.DEBUG = args.debug

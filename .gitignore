@@ -14,12 +14,17 @@ build/
 dist/
 *.spec
 
-# Données générées par le programme (jamais versionnées : régénérables)
-cache/*.sqlite3
-logs/*.log
-logs/*.log.*
-output/*.xlsx
-output/*.xls
+# Données générées par le programme (jamais versionnées : régénérables) —
+# `**/` couvre aussi bien un fichier direct (cache/http_cache.sqlite3, une
+# exécution --cache-dir=cache non isolée par commune) que la structure
+# isolée par commune utilisée en pratique (cache/<commune>/http_cache.sqlite3,
+# voir --cache-dir dans main.py) : un simple `cache/*.sqlite3` ne matchait
+# pas ce deuxième cas, laissant ces fichiers suivis par erreur.
+cache/**/*.sqlite3
+logs/**/*.log
+logs/**/*.log.*
+output/**/*.xlsx
+output/**/*.xls
 
 # Fichiers de verrouillage Excel
 ~$*.xlsx

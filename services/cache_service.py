@@ -254,16 +254,34 @@ class ProgressStore:
     def supprimer_resultat(self, commune: str, identifiant: str) -> None:
         """Retire une parcelle déjà résolue de `parcelle_resultats` — sans
         effet si elle n'a jamais été résolue (donc jamais présente). Utilisé
-        par `nettoyer_doublons_sans_adresse` : une parcelle sans adresse
-        découverte à tort (elle a en fait une adresse sur une autre rue) ne
-        doit plus apparaître du tout dans le fichier de sortie, pas
-        seulement être corrigée."""
+        par main.py::recalculer_cote_position (une parcelle sans adresse
+        découverte à tort ne doit plus apparaître du tout dans le fichier de
+        sortie, pas seulement être corrigée) et par
+        main.py::supprimer_parcelles_hors_codes_postaux."""
         with self._lock, self._connect() as conn:
             conn.execute(
                 "DELETE FROM parcelle_resultats WHERE commune = ? AND identifiant = ?",
                 (commune, identifiant),
             )
             conn.commit()
+
+    def identifiants_hors_codes_postaux(self, commune: str, codes_postaux_autorises: List[str]) -> List[str]:
+        """Identifiants des parcelles déjà résolues de cette commune dont le
+        code postal (colonne "B") n'est PAS dans `codes_postaux_autorises`
+        — sert au nettoyage définitif après un rattrapage lancé sans filtre
+        de code postal sur une commune fusionnée (incident réel : Courcelles,
+        collaboratrice en charge du seul 6180, lignes jusqu'à 6183 trouvées
+        après coup — voir main.py::supprimer_parcelles_hors_codes_postaux).
+        Ne supprime rien elle-même : liste seulement, pour permettre un
+        aperçu avant confirmation côté appelant (voir gui.py)."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT identifiant, valeurs FROM parcelle_resultats WHERE commune = ?", (commune,),
+            ).fetchall()
+        return [
+            identifiant for identifiant, valeurs in rows
+            if json.loads(valeurs).get("B") not in codes_postaux_autorises
+        ]
 
     def parcelles_sans_adresse(self, commune: str, rue: str) -> List[Dict[str, Any]]:
         """Parcelles sans adresse déjà découvertes pour cette rue (voir

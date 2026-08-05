@@ -19,11 +19,17 @@ from utils.logger import get_logger
 _logger = get_logger("utils.retry")
 
 # Erreurs considérées comme temporaires : timeouts, coupures de connexion,
-# erreurs serveur 5xx (via requests.exceptions.HTTPError levée par
-# response.raise_for_status()), et erreurs ArcGIS >= 500 renvoyées en HTTP
-# 200 avec le code dans le corps JSON (voir services/geoportail_service.py
-# et services/exceptions.py — ex: "Service not started.", observé en
-# production sur le service LOT/GCU, résolu par un simple réessai).
+# réponses tronquées en cours de transfert (ChunkedEncodingError — observé
+# en production sur le workflow GitHub Actions de Colfontaine : "Response
+# ended prematurely" en plein milieu du recalcul, PAS un sous-type de
+# ConnectionError malgré la ressemblance, donc jusque-là jamais réessayé et
+# faisant planter tout le traitement de la commune au lieu d'un simple
+# nouvel essai), erreurs serveur 5xx (via requests.exceptions.HTTPError
+# levée par response.raise_for_status()), et erreurs ArcGIS >= 500 renvoyées
+# en HTTP 200 avec le code dans le corps JSON (voir
+# services/geoportail_service.py et services/exceptions.py — ex: "Service
+# not started.", observé en production sur le service LOT/GCU, résolu par
+# un simple réessai).
 #
 # Un HTTPError 4xx (ex: 414 Request-URI Too Large, observé en production
 # sur le service PASH avec une géométrie cadastrale très complexe) est en
@@ -32,7 +38,12 @@ _logger = get_logger("utils.retry")
 # backoff) sans jamais pouvoir réussir. Seuls les HTTPError 5xx (erreur
 # serveur, potentiellement transitoire) sont donc réessayés.
 def _est_reessayable(exc: BaseException) -> bool:
-    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ArcGISTransientError)):
+    if isinstance(exc, (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ChunkedEncodingError,
+        ArcGISTransientError,
+    )):
         return True
     if isinstance(exc, requests.exceptions.HTTPError):
         status = exc.response.status_code if exc.response is not None else None
