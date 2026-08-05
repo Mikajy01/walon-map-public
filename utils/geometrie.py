@@ -21,26 +21,172 @@ import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 Segment = Tuple[float, float, float, float, float]  # x1, y1, x2, y2, distance_cumulee_avant_ce_segment
+Chemin = List[Sequence[float]]
+
+# Distance en dessous de laquelle deux extrémités de tronçons PICC sont
+# considérées comme le même point (un vrai raccord) — les raccords réels
+# observés en conditions réelles sont à <1m (imprécision de digitalisation),
+# largement sous ce seuil ; un vrai tronçon disjoint (rue interrompue) en
+# serait bien plus loin.
+_TOLERANCE_RACCORD_M = 2.0
 
 
-def construire_segments(troncons: Sequence[Dict[str, Any]]) -> List[Segment]:
+def _distance(p1: Sequence[float], p2: Sequence[float]) -> float:
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+
+def _rechainer_chemins(chemins: Sequence[Chemin]) -> List[Chemin]:
+    """Réordonne et réoriente une liste de chemins (chacun une polyligne
+    [[x,y], ...]) pour qu'ils s'enchaînent bout à bout de façon continue et
+    cohérente — nécessaire car une rue est souvent découpée en plusieurs
+    tronçons PICC indépendants (ex: coupés à chaque carrefour), renvoyés par
+    le service dans un ordre quelconque et parfois digitalisés en sens
+    opposés. Sans ce recollement, concaténer les tronçons tels quels produit
+    des positions qui font des sauts incohérents, et un côté (gauche/droite,
+    calculé sur la direction locale de chaque tronçon) qui peut s'inverser
+    d'un tronçon à l'autre alors que c'est géométriquement le même côté
+    physique de la rue (cas réel observé : Avenue Jules Sartieaux, Dour, 3
+    tronçons dont deux qu'il fallait inverser pour se raccorder correctement
+    au troisième).
+
+    Algorithme glouton : part d'un chemin (si possible un dont une
+    extrémité n'a aucun voisin proche parmi les autres — donc un vrai bout
+    de la rue, pour ancrer la position "0" dessus plutôt que sur un point
+    de raccord arbitraire), puis cherche à chaque étape parmi les chemins
+    restants celui dont une extrémité est la plus proche de la fin du
+    chemin courant (à moins de `_TOLERANCE_RACCORD_M`), l'ajoute (inversé
+    si c'est sa fin qui se raccorde), recommence. Un chemin sans aucun
+    voisin proche démarre une nouvelle chaîne accolée à la suite plutôt que
+    de planter — une rue peut être réellement interrompue."""
+    if len(chemins) <= 1:
+        return list(chemins)
+
+    def _plus_proche_voisin(point: Sequence[float], exclure: int) -> Optional[float]:
+        meilleure: Optional[float] = None
+        for j, c in enumerate(chemins):
+            if j == exclure:
+                continue
+            for extremite in (c[0], c[-1]):
+                d = _distance(point, extremite)
+                if meilleure is None or d < meilleure:
+                    meilleure = d
+        return meilleure
+
+    restants = list(range(len(chemins)))
+    depart = 0
+    inverser_depart = False
+    for i in range(len(chemins)):
+        d_debut = _plus_proche_voisin(chemins[i][0], i)
+        d_fin = _plus_proche_voisin(chemins[i][-1], i)
+        debut_isole = d_debut is None or d_debut > _TOLERANCE_RACCORD_M
+        fin_isolee = d_fin is None or d_fin > _TOLERANCE_RACCORD_M
+        if debut_isole and not fin_isolee:
+            depart, inverser_depart = i, False
+            break
+        if fin_isolee and not debut_isole:
+            depart, inverser_depart = i, True
+            break
+
+    restants.remove(depart)
+    premier = list(reversed(chemins[depart])) if inverser_depart else list(chemins[depart])
+    chaine: List[Chemin] = [premier]
+
+    while restants:
+        fin_actuelle = chaine[-1][-1]
+        meilleur_idx = None
+        meilleure_distance = None
+        meilleur_inverser = False
+        for pos, j in enumerate(restants):
+            d_debut = _distance(fin_actuelle, chemins[j][0])
+            if meilleure_distance is None or d_debut < meilleure_distance:
+                meilleure_distance, meilleur_idx, meilleur_inverser = d_debut, pos, False
+            d_fin = _distance(fin_actuelle, chemins[j][-1])
+            if d_fin < meilleure_distance:
+                meilleure_distance, meilleur_idx, meilleur_inverser = d_fin, pos, True
+        j = restants.pop(meilleur_idx)
+        suivant = list(reversed(chemins[j])) if meilleur_inverser else list(chemins[j])
+        chaine.append(suivant)
+
+    return chaine
+
+
+def _segments_depuis_chemins(chemins: Sequence[Chemin]) -> List[Segment]:
+    """Aplatit une liste de chemins déjà dans le bon ordre/sens en une
+    liste de segments avec distance cumulée — partie commune à
+    `construire_segments` et à `_reorienter_vers_plus_petit_numero` (qui a
+    besoin de mesurer une position AVANT de décider s'il faut retourner la
+    chaîne)."""
+    segments: List[Segment] = []
+    distance_cumulee = 0.0
+    for chemin in chemins:
+        for i in range(len(chemin) - 1):
+            x1, y1 = chemin[i]
+            x2, y2 = chemin[i + 1]
+            longueur = math.hypot(x2 - x1, y2 - y1)
+            if longueur == 0:
+                continue
+            segments.append((x1, y1, x2, y2, distance_cumulee))
+            distance_cumulee += longueur
+    return segments
+
+
+def _reorienter_vers_plus_petit_numero(
+    chemins: List[Chemin], point_reference: Optional[Tuple[float, float]],
+) -> List[Chemin]:
+    """Retourne la chaîne de chemins (déjà recollée dans le bon ordre/sens
+    par `_rechainer_chemins`) si besoin, pour que `point_reference` (le
+    point de la parcelle au numéro de rue connu le plus bas — voir
+    l'appelant) tombe dans la première moitié de la rue plutôt que la
+    seconde. Sans ça, la position "0" reste celle du sens de digitalisation
+    PICC brut, qui ne correspond à rien de significatif pour l'utilisateur
+    (cas réel : Avenue Hyacinthe Harmegnies, tronçon unique donc rien à
+    recoller, mais la position 0 tombait à ~200m du numéro 11 — sans doute
+    vers l'autre bout de la rue). Sans effet si `point_reference` est
+    `None` (aucun numéro connu pour cette rue pour le moment) ou si le
+    tracé est vide."""
+    if point_reference is None:
+        return chemins
+    segments = _segments_depuis_chemins(chemins)
+    if not segments:
+        return chemins
+    dernier = segments[-1]
+    longueur_totale = dernier[4] + math.hypot(dernier[2] - dernier[0], dernier[3] - dernier[1])
+    resultat = cote_et_position(point_reference[0], point_reference[1], segments)
+    if resultat is None:
+        return chemins
+    _, position = resultat
+    if position <= longueur_totale / 2:
+        return chemins
+    return [list(reversed(chemin)) for chemin in reversed(chemins)]
+
+
+def construire_segments(
+    troncons: Sequence[Dict[str, Any]],
+    point_reference: Optional[Tuple[float, float]] = None,
+) -> List[Segment]:
     """Aplatit les tronçons PICC (une ou plusieurs polylignes) en une seule
     liste de segments, avec la distance cumulée parcourue avant chaque
     segment — sert de repère linéaire unique pour toute la rue, même
-    composée de plusieurs tronçons (ex: coupée par un carrefour)."""
-    segments: List[Segment] = []
-    distance_cumulee = 0.0
-    for troncon in troncons:
-        for chemin in (troncon.get("geometry") or {}).get("paths", []):
-            for i in range(len(chemin) - 1):
-                x1, y1 = chemin[i]
-                x2, y2 = chemin[i + 1]
-                longueur = math.hypot(x2 - x1, y2 - y1)
-                if longueur == 0:
-                    continue
-                segments.append((x1, y1, x2, y2, distance_cumulee))
-                distance_cumulee += longueur
-    return segments
+    composée de plusieurs tronçons (ex: coupée par un carrefour). Les
+    chemins sont d'abord recollés dans le bon ordre/sens (voir
+    `_rechainer_chemins`) avant d'être aplatis.
+
+    `point_reference` (x, y de la parcelle au numéro de rue connu le plus
+    bas, si disponible) permet en plus d'ancrer la position "0" du bon côté
+    de la rue plutôt que de dépendre du sens de digitalisation PICC brut
+    (voir `_reorienter_vers_plus_petit_numero`) — omis (`None`) pour les
+    usages qui ne se soucient pas de l'orientation globale (ex: distance
+    minimale à une rue pour départager la rue la plus proche, insensible à
+    l'orientation)."""
+    chemins = [
+        chemin
+        for troncon in troncons
+        for chemin in (troncon.get("geometry") or {}).get("paths", [])
+        if len(chemin) >= 2
+    ]
+    chemins = _rechainer_chemins(chemins)
+    chemins = _reorienter_vers_plus_petit_numero(chemins, point_reference)
+    return _segments_depuis_chemins(chemins)
 
 
 def cote_et_position(x: float, y: float, segments: Sequence[Segment]) -> Optional[Tuple[str, float]]:

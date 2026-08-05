@@ -13,6 +13,7 @@ la bordent mais n'ont pas d'adresse enregistrée, avec `numero = "/"`.
 from __future__ import annotations
 
 import math
+import re
 from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -325,7 +326,10 @@ class CadastreService:
             if codes_rue and not (codes_rue & set(codes_postaux)):
                 return parcelles
 
-        sans_adresse = self._parcelles_cadastrales_sans_adresse(pays, commune, rue, parcelles, force=force)
+        point_reference = self._point_reference_numero(parcelles)
+        sans_adresse = self._parcelles_cadastrales_sans_adresse(
+            pays, commune, rue, parcelles, point_reference=point_reference, force=force,
+        )
 
         # Côté ("G"/"D") et position le long de la rue (voir
         # utils/geometrie.py) — calculés pour les parcelles AVEC adresse ici
@@ -336,7 +340,7 @@ class CadastreService:
         # supplémentaire réel, juste une lecture de cache dans la majorité
         # des cas.
         troncons = self.recuperer_troncons(commune, rue)
-        segments = construire_segments(troncons)
+        segments = construire_segments(troncons, point_reference=point_reference)
         for p in parcelles:
             if p.x is None or p.y is None:
                 continue
@@ -408,7 +412,8 @@ class CadastreService:
     # -- Parcelles cadastrales sans adresse (complétion CADMAP + PICC) ------
 
     def _parcelles_cadastrales_sans_adresse(
-        self, pays: str, commune: str, rue: str, parcelles_icar: List[Parcelle], force: bool = False,
+        self, pays: str, commune: str, rue: str, parcelles_icar: List[Parcelle],
+        point_reference: Optional[Tuple[float, float]] = None, force: bool = False,
     ) -> List[Parcelle]:
         """Parcelles CADMAP bordant la rue (tracé réel, couche PICC "Voirie -
         Axe") qui ne correspondent à AUCUNE adresse ICAR déjà connue de
@@ -441,7 +446,12 @@ class CadastreService:
         un INSERT OR REPLACE par parcelle, jamais une purge) ; les entrées
         qui ne devraient plus y figurer (adresse ailleurs trouvée entre
         temps, rue plus proche identifiée) sont nettoyées séparément par
-        les phases dédiées du même rattrapage, pas ici."""
+        les phases dédiées du même rattrapage, pas ici.
+
+        `point_reference` (voir `_point_reference_numero`) ancre la
+        position "0" du tracé sur la parcelle au plus petit numéro de rue
+        connu plutôt que sur le sens de digitalisation PICC brut — voir
+        `utils/geometrie.py::construire_segments`."""
         if not force and self._progress_store is not None and self._progress_store.rue_deja_verifiee(commune, rue):
             return [
                 Parcelle(
@@ -487,7 +497,7 @@ class CadastreService:
                     capakeys_vus[capakey] = feature
 
         code_postal = self._code_postal_le_plus_frequent(parcelles_icar)
-        segments = construire_segments(troncons)
+        segments = construire_segments(troncons, point_reference=point_reference)
 
         nouvelles: List[Parcelle] = []
         for capakey, feature in capakeys_vus.items():
@@ -560,6 +570,27 @@ class CadastreService:
         if not codes:
             return "/"
         return Counter(codes).most_common(1)[0][0]
+
+    @staticmethod
+    def _point_reference_numero(parcelles: List[Parcelle]) -> Optional[Tuple[float, float]]:
+        """Point (x, y) de la parcelle adressée au plus petit numéro de rue
+        connu parmi `parcelles` — sert à ancrer la position "0" de
+        `construire_segments` sur un point significatif (voir
+        utils/geometrie.py::_reorienter_vers_plus_petit_numero) plutôt que
+        sur le sens de digitalisation PICC brut. `None` si aucune parcelle
+        n'a de numéro purement numérique exploitable (aucun changement de
+        comportement dans ce cas — voir l'appelant)."""
+        meilleur: Optional[Tuple[int, float, float]] = None
+        for p in parcelles:
+            if p.x is None or p.y is None or not p.numero:
+                continue
+            m = re.match(r"^(\d+)", p.numero)
+            if not m:
+                continue
+            valeur = int(m.group(1))
+            if meilleur is None or valeur < meilleur[0]:
+                meilleur = (valeur, p.x, p.y)
+        return (meilleur[1], meilleur[2]) if meilleur is not None else None
 
     # -- Rattachement à la parcelle cadastrale (CADMAP) ---------------------
     # Étape coûteuse (1 requête réseau par parcelle) : à appeler seulement

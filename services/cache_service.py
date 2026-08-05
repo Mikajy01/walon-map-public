@@ -200,6 +200,26 @@ class ProgressStore:
                 )
                 """
             )
+            # Marque les rues dont côté/position ont déjà été recalculés
+            # avec les tronçons PICC recollés dans le bon ordre/sens (voir
+            # utils/geometrie.py::_rechainer_chemins et
+            # main.py::recalculer_cote_position) — une rue à un seul
+            # tronçon n'est jamais affectée par ce recollement (marquée
+            # immédiatement, rien à recalculer) ; une rue à plusieurs
+            # tronçons pouvait avoir un côté/position incohérent avant ce
+            # correctif (cas réel : Avenue Jules Sartieaux, Dour, 3
+            # tronçons dont deux digitalisés en sens inverse). Même
+            # nécessité qu'avec `rues_redecouvertes_rayon_elargi` : éviter
+            # de refaire ce travail à chaque relance du rattrapage.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rues_geometrie_recollee (
+                    commune TEXT NOT NULL,
+                    rue TEXT NOT NULL,
+                    PRIMARY KEY (commune, rue)
+                )
+                """
+            )
             conn.commit()
 
     def rue_deja_verifiee(self, commune: str, rue: str) -> bool:
@@ -236,6 +256,26 @@ class ProgressStore:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO rues_redecouvertes_rayon_elargi (commune, rue) VALUES (?, ?)",
+                (commune, rue),
+            )
+            conn.commit()
+
+    def rue_geometrie_recollee(self, commune: str, rue: str) -> bool:
+        """True si côté/position de cette rue ont déjà été recalculés avec
+        les tronçons PICC recollés dans le bon ordre/sens (voir
+        utils/geometrie.py::_rechainer_chemins et
+        main.py::recalculer_cote_position)."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM rues_geometrie_recollee WHERE commune = ? AND rue = ?",
+                (commune, rue),
+            ).fetchone()
+        return row is not None
+
+    def marquer_rue_geometrie_recollee(self, commune: str, rue: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO rues_geometrie_recollee (commune, rue) VALUES (?, ?)",
                 (commune, rue),
             )
             conn.commit()

@@ -18,12 +18,13 @@ Usage :
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import sys
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import config
 from models.parcelle import Parcelle
@@ -524,7 +525,7 @@ def recalculer_cote_position(
     """Rattrapage géométrique unique, à lancer une fois par commune, qui
     corrige en une passe tout ce qui a changé après coup dans le calcul
     géométrique des parcelles déjà connues (un seul bouton/flag plutôt
-    qu'un par correction, sur demande explicite — les quatre problèmes
+    qu'un par correction, sur demande explicite — les cinq problèmes
     partagent le même besoin de base : reparcourir les rues déjà connues
     et récupérer leur tracé PICC) :
 
@@ -533,19 +534,27 @@ def recalculer_cote_position(
        l'origine) les rues déjà vérifiées, pour capturer les parcelles
        "de deuxième rangée" que l'ancien rayon ratait (cas réel : fichier
        de référence de Crisnée, parcelles jusqu'à 176m du tracé). Nettement
-       plus coûteux que les trois étapes suivantes (fenêtre de recherche
-       ~64x plus grande) — pour une commune déjà largement traitée, à
-       lancer de préférence via le workflow GitHub Actions dédié plutôt
-       qu'en local.
-    2. Calcule côté/position (voir utils/geometrie.py) pour les parcelles
+       plus coûteux que les étapes suivantes (fenêtre de recherche ~64x
+       plus grande) — pour une commune déjà largement traitée, à lancer
+       de préférence via le workflow GitHub Actions dédié plutôt qu'en
+       local.
+    2. Recolle les tronçons PICC d'une rue dans le bon ordre/sens (voir
+       `utils/geometrie.py::_rechainer_chemins`) et recalcule côté/position
+       pour TOUTES les parcelles déjà résolues des rues à plusieurs
+       tronçons (une rue à tronçon unique n'est jamais affectée) — sans ce
+       recollement, une rue coupée à un carrefour peut avoir un côté qui
+       s'inverse et une position qui saute d'un tronçon à l'autre (cas
+       réel : Avenue Jules Sartieaux, Dour, 3 tronçons dont deux
+       digitalisés en sens inverse).
+    3. Calcule côté/position (voir utils/geometrie.py) pour les parcelles
        déjà résolues qui ne l'ont pas encore (ajouté après coup — inclut
        les parcelles fraîchement trouvées par l'étape 1 une fois résolues).
-    3. Retire les parcelles "sans adresse" ajoutées à tort alors qu'elles
+    4. Retire les parcelles "sans adresse" ajoutées à tort alors qu'elles
        ont en réalité une adresse ICAR ailleurs dans la commune (voir
        `CadastreService.a_une_adresse_ailleurs` — cas réel : Dour, parcelle
        91P3, adresse "170" sur Rue Moranfayt mais aussi listée en "/" sous
        Avenue Hyacinthe Harmegnies qu'elle borde aussi).
-    4. Pour une parcelle sans adresse trouvée candidate sur PLUSIEURS rues
+    5. Pour une parcelle sans adresse trouvée candidate sur PLUSIEURS rues
        à la fois (cas réel : parcelle 91S2, candidate à la fois sur deux
        rues voisines — plus fréquent depuis l'élargissement du rayon de
        l'étape 1), ne garde que la rue dont le tracé est géométriquement
@@ -559,7 +568,7 @@ def recalculer_cote_position(
     fait rien. Renvoie le nombre total de corrections effectuées (0 si la
     commune n'a rien à rattraper).
 
-    `codes_postaux`, si fourni, restreint les quatre étapes aux rues/
+    `codes_postaux`, si fourni, restreint les cinq étapes aux rues/
     parcelles de ces codes postaux — indispensable pour une commune
     fusionnée dont chaque collaborateur ne gère qu'un sous-ensemble des
     codes postaux (ex: Comines-Warneton, 7780-7784) : sans ce filtre, le
@@ -572,9 +581,30 @@ def recalculer_cote_position(
     total_corrections = 0
     segments_par_rue: Dict[str, list] = {}
 
+    def _point_reference(rue: str) -> Optional[Tuple[float, float]]:
+        """Point de la parcelle déjà résolue au plus petit numéro de rue
+        connu pour `rue` (voir CadastreService._point_reference_numero,
+        même principe mais à partir des entrées déjà en base plutôt que
+        d'une liste ICAR fraîchement interrogée) — ancre la position "0"
+        du tracé sur ce point plutôt que sur le sens de digitalisation PICC
+        brut. `None` si aucun numéro purement numérique n'est encore connu
+        pour cette rue (aucun changement de comportement dans ce cas)."""
+        meilleur: Optional[Tuple[int, str]] = None
+        for identifiant, valeurs in base.items():
+            if valeurs.get("D") != rue:
+                continue
+            m = re.match(r"^(\d+)", valeurs.get("E") or "")
+            if not m:
+                continue
+            valeur = int(m.group(1))
+            if meilleur is None or valeur < meilleur[0]:
+                meilleur = (valeur, identifiant)
+        return cadastre_service.point_pour_identifiant(meilleur[1]) if meilleur is not None else None
+
     def _segments(rue: str) -> list:
         if rue not in segments_par_rue:
-            segments_par_rue[rue] = construire_segments(cadastre_service.recuperer_troncons(commune, rue))
+            troncons = cadastre_service.recuperer_troncons(commune, rue)
+            segments_par_rue[rue] = construire_segments(troncons, point_reference=_point_reference(rue))
         return segments_par_rue[rue]
 
     # -- 1. Redécouvrir avec le rayon élargi les rues déjà vérifiées -------
@@ -605,8 +635,75 @@ def recalculer_cote_position(
             )
             total_corrections += len(nouvelles_capakeys)
 
-    # -- 2. Côté/position manquants (parcelles déjà résolues) --------------
     base = progress_store.all_for_commune(commune)
+
+    # -- 2. Recoller les tronçons dans le bon ordre/sens (rues à plusieurs
+    # tronçons uniquement) — voir utils/geometrie.py::_rechainer_chemins.
+    # Une rue déjà résolue AVANT ce correctif peut avoir un côté/position
+    # incohérent si son tracé est coupé en plusieurs tronçons PICC (cas
+    # réel : Avenue Jules Sartieaux, Dour, 3 tronçons dont deux digitalisés
+    # en sens inverse — la position faisait des sauts et le côté
+    # s'inversait d'un tronçon à l'autre). Contrairement à l'étape suivante
+    # (qui ne comble que les valeurs manquantes), celle-ci recalcule TOUTES
+    # les parcelles déjà résolues de la rue, puisque leur côté/position
+    # existant peut être faux, pas seulement absent. Une rue à un seul
+    # tronçon n'est jamais affectée par ce recollement (marquée
+    # immédiatement, rien à recalculer).
+    rues_connues = set(progress_store.rues_verifiees_commune(commune))
+    rues_connues.update(v.get("D", "") for v in base.values() if v.get("D"))
+    rues_a_recoller = sorted(
+        rue for rue in rues_connues if rue and not progress_store.rue_geometrie_recollee(commune, rue)
+    )
+    for rue_index, rue in enumerate(rues_a_recoller):
+        if on_progress:
+            on_progress("recollement_troncons", rue_index + 1, len(rues_a_recoller))
+        troncons = cadastre_service.recuperer_troncons(commune, rue)
+        nb_chemins = sum(len((t.get("geometry") or {}).get("paths", [])) for t in troncons)
+        if nb_chemins <= 1:
+            if codes_postaux is None:
+                progress_store.marquer_rue_geometrie_recollee(commune, rue)
+            continue
+
+        segments = _segments(rue)
+        entrees_rue = {ident: valeurs for ident, valeurs in base.items() if valeurs.get("D") == rue}
+        filtre_a_ignore_une_entree = False
+        corrigees_cette_rue = 0
+        for identifiant, valeurs in entrees_rue.items():
+            if codes_postaux is not None and valeurs.get("B") not in codes_postaux:
+                filtre_a_ignore_une_entree = True
+                continue
+            point = cadastre_service.point_pour_identifiant(identifiant)
+            if point is None:
+                continue
+            resultat = cote_et_position(point[0], point[1], segments)
+            if resultat is None:
+                continue
+            cote, position = resultat
+            if valeurs.get("_cote") == cote and valeurs.get("_position") == position:
+                continue
+            valeurs["_cote"] = cote
+            valeurs["_position"] = position
+            progress_store.set(commune, identifiant, valeurs)
+            if "|CAPAKEY:" in identifiant:
+                capakey = identifiant.rsplit("CAPAKEY:", 1)[-1]
+                progress_store.maj_cote_position_sans_adresse(commune, rue, capakey, cote, position)
+            corrigees_cette_rue += 1
+        # Ne marque la rue "recollée" que si elle a été traitée sans filtre
+        # de code postal actif (ou si le filtre couvrait déjà toutes ses
+        # parcelles) — sinon une future exécution avec un filtre différent
+        # ne la retraiterait jamais, laissant les parcelles ignorées avec
+        # un côté/position potentiellement faux pour toujours (même
+        # principe que l'étape 1 pour --code-postal).
+        if not filtre_a_ignore_une_entree:
+            progress_store.marquer_rue_geometrie_recollee(commune, rue)
+        if corrigees_cette_rue:
+            _logger.info(
+                "Commune '%s' : rue '%s' recollée (%d tronçon(s)) — %d parcelle(s) "
+                "côté/position recalculée(s).", commune, rue, nb_chemins, corrigees_cette_rue,
+            )
+            total_corrections += corrigees_cette_rue
+
+    # -- 3. Côté/position manquants (parcelles déjà résolues) --------------
     a_corriger_cote_position: Dict[str, list] = {}
     for identifiant, valeurs in base.items():
         if codes_postaux is not None and valeurs.get("B") not in codes_postaux:
@@ -647,7 +744,7 @@ def recalculer_cote_position(
                 progress_store.maj_cote_position_sans_adresse(commune, rue, capakey, cote, position)
             total_corrections += 1
 
-    # -- 3. Parcelles "sans adresse" ayant en réalité une adresse ailleurs -
+    # -- 4. Parcelles "sans adresse" ayant en réalité une adresse ailleurs -
     rues_verifiees = progress_store.rues_verifiees_commune(commune)
     for rue_index, rue in enumerate(rues_verifiees):
         if on_progress:
@@ -667,7 +764,7 @@ def recalculer_cote_position(
             )
             total_corrections += 1
 
-    # -- 4. Parcelles "sans adresse" candidates sur plusieurs rues à la fois
+    # -- 5. Parcelles "sans adresse" candidates sur plusieurs rues à la fois
     # (relire rues_verifiees + parcelles_sans_adresse APRÈS l'étape 3 :
     # une parcelle qui vient d'être retirée là-haut ne doit pas être
     # comparée ici, elle n'est de toute façon plus "sans adresse")
@@ -719,8 +816,8 @@ def recalculer_cote_position(
         _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
         _logger.info(
             "Commune '%s' : %d correction(s) géométrique(s) appliquée(s) (nouvelles parcelles "
-            "au rayon élargi, côté/position, doublons adresse ailleurs, doublons rue la plus "
-            "proche confondus).", commune, total_corrections,
+            "au rayon élargi, tronçons recollés, côté/position, doublons adresse ailleurs, "
+            "doublons rue la plus proche confondus).", commune, total_corrections,
         )
     else:
         _logger.info(
