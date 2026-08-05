@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import config
 from models.parcelle import Parcelle
@@ -32,7 +32,7 @@ from services.cadastre_service import CadastreService
 from services.excel_service import ExcelService
 from services.geoportail_service import ArcGISRestClient
 from services.layers_service import LayersService
-from utils.geometrie import construire_segments, cote_et_position
+from utils.geometrie import construire_segments, cote_et_position, distance_min_polygone_rue
 from utils.logger import get_logger, setup_logging
 from utils.progress import progress
 from utils.rate_limiter import RateLimiter
@@ -146,11 +146,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--recalculer-cote-position", action="store_true",
-        help="Rattrapage, au lieu du traitement normal : calcule côté/position "
-             "(voir utils/geometrie.py) pour les parcelles déjà résolues avant "
-             "l'ajout de ce calcul. À lancer une fois par commune (ex: workflow "
-             "GitHub Actions dédié) — les parcelles traitées normalement l'ont "
-             "déjà, --limit et --code-postal sont ignorés dans ce mode.",
+        help="Rattrapage géométrique, au lieu du traitement normal : calcule "
+             "côté/position (voir utils/geometrie.py) pour les parcelles déjà "
+             "résolues qui ne l'ont pas encore, retire les parcelles 'sans "
+             "adresse' ajoutées à tort alors qu'elles ont une adresse ailleurs "
+             "dans la commune, et pour celles candidates sur plusieurs rues à "
+             "la fois ne garde que la plus proche géométriquement (voir "
+             "main.py::recalculer_cote_position). À lancer une fois par "
+             "commune (ex: workflow GitHub Actions dédié) — les parcelles "
+             "traitées normalement n'ont déjà plus ces problèmes, --limit et "
+             "--code-postal sont ignorés dans ce mode.",
     )
     parser.add_argument(
         "--retraiter-echecs", action="store_true",
@@ -513,29 +518,51 @@ def recalculer_cote_position(
     output_path: Optional[Path] = None,
     on_progress: Optional[ProgressCallback] = None,
 ) -> int:
-    """Rattrapage pour les parcelles déjà résolues AVANT l'ajout du calcul
-    côté/position (voir utils/geometrie.py) — les parcelles traitées par
-    `traiter_commune` depuis cet ajout l'ont déjà (voir
-    `_set_identification_columns`), inutile de les repasser ici.
+    """Rattrapage géométrique unique, à lancer une fois par commune, qui
+    corrige en une passe tout ce qui a changé après coup dans le calcul
+    géométrique des parcelles déjà connues (un seul bouton/flag plutôt
+    qu'un par correction, sur demande explicite — les trois problèmes
+    partagent le même besoin de base : reparcourir les rues déjà connues
+    et récupérer leur tracé PICC) :
 
-    Regroupe les parcelles à corriger par rue pour ne récupérer le tracé
-    PICC (`recuperer_troncons`) qu'une seule fois par rue plutôt qu'une
-    fois par parcelle. Renvoie le nombre de parcelles effectivement
-    corrigées (0 si la commune n'a rien à rattraper)."""
+    1. Calcule côté/position (voir utils/geometrie.py) pour les parcelles
+       déjà résolues qui ne l'ont pas encore (ajouté après coup).
+    2. Retire les parcelles "sans adresse" ajoutées à tort alors qu'elles
+       ont en réalité une adresse ICAR ailleurs dans la commune (voir
+       `CadastreService.a_une_adresse_ailleurs` — cas réel : Dour, parcelle
+       91P3, adresse "170" sur Rue Moranfayt mais aussi listée en "/" sous
+       Avenue Hyacinthe Harmegnies qu'elle borde aussi).
+    3. Pour une parcelle sans adresse trouvée candidate sur PLUSIEURS rues
+       à la fois (cas réel : parcelle 91S2, candidate à la fois sur deux
+       rues voisines), ne garde que la rue dont le tracé est
+       géométriquement le plus proche du polygone de la parcelle (voir
+       `utils/geometrie.py::distance_min_polygone_rue`), retire les autres.
+
+    Les parcelles traitées normalement (`traiter_commune`) depuis l'ajout
+    de ces vérifications n'ont déjà plus ces problèmes ; relancer ceci ne
+    fait rien. Renvoie le nombre total de corrections effectuées (0 si la
+    commune n'a rien à rattraper)."""
+    total_corrections = 0
+    segments_par_rue: Dict[str, list] = {}
+
+    def _segments(rue: str) -> list:
+        if rue not in segments_par_rue:
+            segments_par_rue[rue] = construire_segments(cadastre_service.recuperer_troncons(commune, rue))
+        return segments_par_rue[rue]
+
+    # -- 1. Côté/position manquants (parcelles déjà résolues) --------------
     base = progress_store.all_for_commune(commune)
-    a_corriger: dict = {}
+    a_corriger_cote_position: Dict[str, list] = {}
     for identifiant, valeurs in base.items():
-        if "_cote" in valeurs and "_position" in valeurs:
-            continue
-        a_corriger.setdefault(valeurs.get("D", ""), []).append((identifiant, valeurs))
+        if "_cote" not in valeurs or "_position" not in valeurs:
+            a_corriger_cote_position.setdefault(valeurs.get("D", ""), []).append((identifiant, valeurs))
 
-    total_corrigees = 0
-    rues = list(a_corriger.items())
-    for rue_index, (rue, entrees) in enumerate(rues):
+    rues_a_visiter = sorted(a_corriger_cote_position.keys())
+    for rue_index, rue in enumerate(rues_a_visiter):
         if on_progress:
-            on_progress("recalcul_côté_position", rue_index + 1, len(rues))
-        troncons = cadastre_service.recuperer_troncons(commune, rue)
-        segments = construire_segments(troncons)
+            on_progress("recalcul_côté_position", rue_index + 1, len(rues_a_visiter))
+        segments = _segments(rue)
+        entrees = a_corriger_cote_position[rue]
         if not segments:
             _logger.warning(
                 "Rue '%s' (%s) : tracé PICC introuvable, côté/position non calculables "
@@ -561,20 +588,85 @@ def recalculer_cote_position(
             if "|CAPAKEY:" in identifiant:
                 capakey = identifiant.rsplit("CAPAKEY:", 1)[-1]
                 progress_store.maj_cote_position_sans_adresse(commune, rue, capakey, cote, position)
-            total_corrigees += 1
+            total_corrections += 1
 
-    if total_corrigees:
+    # -- 2. Parcelles "sans adresse" ayant en réalité une adresse ailleurs -
+    rues_verifiees = progress_store.rues_verifiees_commune(commune)
+    for rue_index, rue in enumerate(rues_verifiees):
+        if on_progress:
+            on_progress("nettoyage_adresse_ailleurs", rue_index + 1, len(rues_verifiees))
+        for entree in progress_store.parcelles_sans_adresse(commune, rue):
+            rings = (entree.get("geometry") or {}).get("rings", [])
+            if not rings or not cadastre_service.a_une_adresse_ailleurs(commune, rings):
+                continue
+            capakey = entree["capakey"]
+            progress_store.supprimer_parcelle_sans_adresse(commune, rue, capakey)
+            progress_store.supprimer_resultat(commune, f"{commune}|CAPAKEY:{capakey}")
+            _logger.info(
+                "Commune '%s' : parcelle %s (rue '%s') retirée — a en réalité une adresse "
+                "sur une autre rue.", commune, capakey, rue,
+            )
+            total_corrections += 1
+
+    # -- 3. Parcelles "sans adresse" candidates sur plusieurs rues à la fois
+    # (relire rues_verifiees + parcelles_sans_adresse APRÈS l'étape 2 :
+    # une parcelle qui vient d'être retirée là-haut ne doit pas être
+    # comparée ici, elle n'est de toute façon plus "sans adresse")
+    rues_candidates_par_capakey: Dict[str, list] = {}
+    for rue in progress_store.rues_verifiees_commune(commune):
+        for entree in progress_store.parcelles_sans_adresse(commune, rue):
+            rues_candidates_par_capakey.setdefault(entree["capakey"], []).append(rue)
+
+    doublons = {capakey: rues for capakey, rues in rues_candidates_par_capakey.items() if len(rues) > 1}
+    for capakey_index, (capakey, rues_candidates) in enumerate(doublons.items()):
+        if on_progress:
+            on_progress("nettoyage_rue_plus_proche", capakey_index + 1, len(doublons))
+        meilleure_rue: Optional[str] = None
+        meilleure_distance: Optional[float] = None
+        for rue in rues_candidates:
+            entree = next(
+                (e for e in progress_store.parcelles_sans_adresse(commune, rue) if e["capakey"] == capakey), None,
+            )
+            if entree is None or not entree.get("geometry"):
+                continue
+            rings = entree["geometry"].get("rings", [])
+            distance = distance_min_polygone_rue(rings, _segments(rue))
+            if distance is not None and (meilleure_distance is None or distance < meilleure_distance):
+                meilleure_distance = distance
+                meilleure_rue = rue
+        if meilleure_rue is None:
+            continue
+
+        identifiant = f"{commune}|CAPAKEY:{capakey}"
+        resultat_actuel = progress_store.get(commune, identifiant)
+        changement = False
+        if resultat_actuel is not None and resultat_actuel.get("D") != meilleure_rue:
+            progress_store.supprimer_resultat(commune, identifiant)
+            changement = True
+        for rue in rues_candidates:
+            if rue != meilleure_rue:
+                progress_store.supprimer_parcelle_sans_adresse(commune, rue, capakey)
+                changement = True
+        if changement:
+            _logger.info(
+                "Commune '%s' : parcelle %s candidate sur %d rue(s) — rue la plus proche "
+                "retenue : '%s'.", commune, capakey, len(rues_candidates), meilleure_rue,
+            )
+            total_corrections += 1
+
+    if total_corrections:
         _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
         _logger.info(
-            "Commune '%s' : %d parcelle(s) corrigée(s) (côté/position calculés rétroactivement).",
-            commune, total_corrigees,
+            "Commune '%s' : %d correction(s) géométrique(s) appliquée(s) (côté/position, "
+            "doublons adresse ailleurs, doublons rue la plus proche confondus).",
+            commune, total_corrections,
         )
     else:
         _logger.info(
-            "Commune '%s' : rien à corriger (toutes les parcelles déjà résolues ont "
-            "déjà côté/position).", commune,
+            "Commune '%s' : rien à corriger (aucune parcelle sans côté/position, aucun "
+            "doublon détecté).", commune,
         )
-    return total_corrigees
+    return total_corrections
 
 
 def retraiter_echecs(

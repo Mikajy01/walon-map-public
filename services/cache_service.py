@@ -190,6 +190,42 @@ class ProgressStore:
             ).fetchone()
         return row is not None
 
+    def rues_verifiees_commune(self, commune: str) -> List[str]:
+        """Toutes les rues déjà vérifiées pour une commune — sert au
+        rattrapage qui reparcourt les parcelles sans adresse déjà mises en
+        cache pour en retirer celles qui ont en réalité une adresse sur une
+        autre rue (voir main.py::nettoyer_doublons_sans_adresse)."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT rue FROM rues_verifiees WHERE commune = ?", (commune,),
+            ).fetchall()
+        return [rue for (rue,) in rows]
+
+    def supprimer_parcelle_sans_adresse(self, commune: str, rue: str, capakey: str) -> None:
+        """Retire une parcelle du cache de découverte 'sans adresse' — sert
+        au rattrapage (voir `rues_verifiees_commune`) quand elle s'avère en
+        réalité avoir une adresse ailleurs dans la commune."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM parcelles_sans_adresse WHERE commune = ? AND rue = ? AND capakey = ?",
+                (commune, rue, capakey),
+            )
+            conn.commit()
+
+    def supprimer_resultat(self, commune: str, identifiant: str) -> None:
+        """Retire une parcelle déjà résolue de `parcelle_resultats` — sans
+        effet si elle n'a jamais été résolue (donc jamais présente). Utilisé
+        par `nettoyer_doublons_sans_adresse` : une parcelle sans adresse
+        découverte à tort (elle a en fait une adresse sur une autre rue) ne
+        doit plus apparaître du tout dans le fichier de sortie, pas
+        seulement être corrigée."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM parcelle_resultats WHERE commune = ? AND identifiant = ?",
+                (commune, identifiant),
+            )
+            conn.commit()
+
     def parcelles_sans_adresse(self, commune: str, rue: str) -> List[Dict[str, Any]]:
         """Parcelles sans adresse déjà découvertes pour cette rue (voir
         `rue_deja_verifiee` — à n'appeler que si True, sinon liste

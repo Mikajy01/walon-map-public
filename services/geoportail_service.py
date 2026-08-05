@@ -124,16 +124,26 @@ class ArcGISRestClient:
         return_geometry: bool = False,
         in_sr: int = 31370,
         out_sr: int = 31370,
+        order_by: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Interroge une sous-couche ArcGIS REST (`/query`) et renvoie TOUTES
         ses features, en paginant automatiquement si le service tronque la
         réponse (`exceededTransferLimit`, ex: `maxRecordCount=2000` observé
         sur ICAR_ADR_PT — une commune comme Dour a largement plus de 2000
-        points d'adresse). Sans cette pagination, une requête tronquée
-        renvoie un sous-ensemble non déterministe (l'ordre des résultats
-        n'est pas garanti sans tri explicite) : deux exécutions peuvent
-        alors compter un nombre différent de rues pour la même commune, et
-        des rues entières peuvent ne jamais être découvertes.
+        points d'adresse).
+
+        `order_by` (ex: `"OBJECTID"`) devrait être fourni pour toute requête
+        susceptible de dépasser une seule page SANS filtre géométrique
+        étroit (ex: toutes les adresses d'une commune entière) : vérifié en
+        conditions réelles sur ICAR_ADR_PT — sans tri explicite, l'ordre
+        renvoyé par page n'est PAS stable d'une page à l'autre. Deux appels
+        avec le même total de features (donc en apparence corrects) peuvent
+        pourtant contenir des ensembles différents : certaines lignes
+        dupliquées d'une page à l'autre, d'autres absentes des deux (cas
+        réel : commune Dour, 7976 adresses sur 4 pages, une adresse précise
+        absente du résultat sans tri, présente et le total inchangé avec
+        `order_by='ADR_ID'`). Sans ce tri, la pagination protège contre un
+        résultat tronqué mais pas contre un résultat incomplet.
 
         `geometry` doit être un dict de géométrie Esri (ex: polygone de
         parcelle) en Lambert 72 (EPSG:31370), système utilisé par la quasi-
@@ -156,6 +166,8 @@ class ArcGISRestClient:
             "returnGeometry": return_geometry,
             "outSR": out_sr,
         }
+        if order_by:
+            base_params["orderByFields"] = order_by
         if geometry is not None:
             base_params.update(
                 {

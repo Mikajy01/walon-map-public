@@ -75,3 +75,55 @@ def cote_et_position(x: float, y: float, segments: Sequence[Segment]) -> Optiona
     if meilleure_distance is None:
         return None
     return meilleur_cote, meilleure_position
+
+
+def _distance_point_segment(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    """Distance minimale entre un point et un segment [x1,y1]-[x2,y2]
+    (projection bornée, comme dans `cote_et_position` — factorisé ici pour
+    être réutilisé par `distance_min_polygone_rue`)."""
+    dx, dy = x2 - x1, y2 - y1
+    longueur_carre = dx * dx + dy * dy
+    if longueur_carre == 0:
+        return math.hypot(px - x1, py - y1)
+    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / longueur_carre))
+    proj_x, proj_y = x1 + t * dx, y1 + t * dy
+    return math.hypot(px - proj_x, py - proj_y)
+
+
+def distance_min_polygone_rue(
+    rings: Sequence[Sequence[Sequence[float]]], segments: Sequence[Segment],
+) -> Optional[float]:
+    """Distance minimale entre le CONTOUR d'un polygone cadastral (chaque
+    côté, pas seulement son centre) et le tracé d'une rue — sert à
+    départager, pour une parcelle sans adresse trouvée candidate sur
+    PLUSIEURS rues à la fois (cas réel : parcelle 91S2, Dour — bordant à la
+    fois Avenue Hyacinthe Harmegnies et une rue voisine dans la marge de
+    recherche des deux), laquelle est réellement la plus proche (voir
+    main.py::recalculer_cote_position). Plus fiable qu'une distance au seul
+    centre du polygone (déjà utilisé pour côté/position, mais insuffisant
+    ici) : un côté du polygone proche d'une rue compte pleinement, même si
+    le centre de la parcelle en est loin (parcelle allongée ou irrégulière).
+
+    Distance segment-à-segment classique (minimum des 4 distances
+    point-à-segment entre les extrémités de chaque paire de segments) —
+    correcte tant que les deux segments ne se croisent pas, ce qui n'arrive
+    jamais ici (une parcelle ne chevauche pas le tracé d'une rue).
+    `None` si le polygone ou la rue n'a aucun côté/segment exploitable."""
+    meilleure: Optional[float] = None
+    for ring in rings:
+        n = len(ring)
+        if n < 2:
+            continue
+        for i in range(n):
+            x1, y1 = ring[i]
+            x2, y2 = ring[(i + 1) % n]
+            for sx1, sy1, sx2, sy2, _ in segments:
+                d = min(
+                    _distance_point_segment(x1, y1, sx1, sy1, sx2, sy2),
+                    _distance_point_segment(x2, y2, sx1, sy1, sx2, sy2),
+                    _distance_point_segment(sx1, sy1, x1, y1, x2, y2),
+                    _distance_point_segment(sx2, sy2, x1, y1, x2, y2),
+                )
+                if meilleure is None or d < meilleure:
+                    meilleure = d
+    return meilleure

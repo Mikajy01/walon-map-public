@@ -195,7 +195,7 @@ class App(ctk.CTk):
         )
         self.bouton_importer_corrige.pack(side="left", padx=(8, 0))
         self.bouton_recalculer_cote_position = ctk.CTkButton(
-            action, text="Recalculer côté/position…", height=40,
+            action, text="Recalculer côté/position et doublons…", height=40,
             command=self._recalculer_cote_position,
         )
         self.bouton_recalculer_cote_position.pack(side="left", padx=(8, 0))
@@ -295,6 +295,8 @@ class App(ctk.CTk):
             "découverte": "Découverte des adresses",
             "recalcul_côté_position": "Recalcul côté/position",
             "retraitement_echecs": "Retraitement des parcelles échouées",
+            "nettoyage_adresse_ailleurs": "Nettoyage des doublons (adresse ailleurs)",
+            "nettoyage_rue_plus_proche": "Nettoyage des doublons (rue la plus proche)",
         }
         libelle = libelles.get(phase, "Remplissage des colonnes")
         self.label_statut.configure(text=f"{libelle}… ({actuel}/{total})")
@@ -492,11 +494,13 @@ class App(ctk.CTk):
     # -- Recalcul côté/position (rattrapage pour les parcelles déjà résolues) -
 
     def _recalculer_cote_position(self) -> None:
-        """Rattrapage à lancer une fois par commune : calcule côté/position
-        (voir utils/geometrie.py) pour les parcelles déjà résolues AVANT
-        l'ajout de ce calcul — voir main.py::recalculer_cote_position. Les
-        parcelles traitées via « Démarrer le traitement » l'ont déjà,
-        inutile de relancer ceci après."""
+        """Rattrapage géométrique à lancer une fois par commune — voir
+        main.py::recalculer_cote_position pour le détail des 3 corrections
+        appliquées en une passe (côté/position manquants, doublons "sans
+        adresse" ayant une adresse ailleurs, doublons "sans adresse"
+        candidats sur plusieurs rues à la fois). Les parcelles traitées via
+        « Démarrer le traitement » depuis l'ajout de ces vérifications
+        n'ont déjà plus ces problèmes, inutile de relancer ceci après."""
         if self._en_cours:
             return
         commune = self.entry_commune.get().strip()
@@ -640,7 +644,7 @@ class App(ctk.CTk):
         self._en_cours = False
         self.bouton_lancer.configure(state="normal", text="Démarrer le traitement")
         self.bouton_importer_corrige.configure(state="normal", text="Importer un Excel corrigé…")
-        self.bouton_recalculer_cote_position.configure(state="normal", text="Recalculer côté/position…")
+        self.bouton_recalculer_cote_position.configure(state="normal", text="Recalculer côté/position et doublons…")
         self.bouton_retraiter_echecs.configure(state="normal", text="Retraiter les parcelles échouées…")
 
     def _fin_traitement(
@@ -692,9 +696,9 @@ class App(ctk.CTk):
         if n:
             self._output_path = chemin
             self.bouton_ouvrir_dossier.configure(state="normal")
-            texte = f"Recalcul terminé — {n} parcelle(s) corrigée(s) (côté/position). Fichier généré : {chemin}"
+            texte = f"Recalcul terminé — {n} correction(s) appliquée(s) (côté/position et doublons). Fichier généré : {chemin}"
         else:
-            texte = "Recalcul terminé — rien à corriger (toutes les parcelles avaient déjà côté/position)."
+            texte = "Recalcul terminé — rien à corriger (côté/position déjà calculés, aucun doublon détecté)."
         self._ajouter_log(texte)
         self.label_statut.configure(text=texte)
         messagebox.showinfo(APP_TITLE, texte)

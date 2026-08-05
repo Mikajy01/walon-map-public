@@ -80,17 +80,66 @@ class CadastreService:
         # (voir _parcelles_cadastrales_sans_adresse) — utile pour un usage
         # ponctuel, mais coûteux pour un traitement complet de commune.
         self._progress_store = progress_store
+        # Cache mémoire (voir _adresses_commune) : la même commune est
+        # revisitée à chaque rue traitée (potentiellement des centaines de
+        # fois par exécution) — évite de reconstruire la liste de points à
+        # chaque appel (la requête réseau elle-même est déjà servie par le
+        # cache HTTP après le premier appel, mais pas la reconstruction de
+        # cette liste Python).
+        self._adresses_commune_cache: Dict[str, List[Tuple[float, float]]] = {}
+
+    def _adresses_commune(self, commune: str) -> List[Tuple[float, float]]:
+        """Coordonnées de TOUTES les adresses ICAR de la commune, toutes
+        rues confondues — sert à `a_une_adresse_ailleurs` pour ne jamais
+        marquer "/" une parcelle qui a en réalité une adresse sur une AUTRE
+        rue que celle en cours de traitement (voir
+        `_parcelles_cadastrales_sans_adresse`, qui ne vérifiait auparavant
+        que les adresses de la rue en cours — cas réel découvert à Dour :
+        la parcelle "91P3" a une adresse ICAR réelle, "170", mais rattachée
+        à Rue Moranfayt, pas à Avenue Hyacinthe Harmegnies qu'elle borde
+        aussi ; elle apparaissait donc à tort deux fois dans le fichier
+        final)."""
+        if commune not in self._adresses_commune_cache:
+            features = self._client.query_layer(
+                service_url=config.ARCGIS_SERVICES["ICAR_ADR_PT"],
+                layer_id=_ICAR_ADRESSES_LAYER_ID,
+                where=f"COM_NM = '{self._escape(commune)}'",
+                out_fields="ADR_ID",
+                return_geometry=True,
+                order_by="ADR_ID",
+            )
+            self._adresses_commune_cache[commune] = [
+                (f["geometry"]["x"], f["geometry"]["y"]) for f in features if f.get("geometry")
+            ]
+        return self._adresses_commune_cache[commune]
+
+    def a_une_adresse_ailleurs(self, commune: str, rings: Sequence[Sequence[Sequence[float]]]) -> bool:
+        """True si au moins une adresse ICAR de la commune (peu importe la
+        rue) tombe dans ce polygone cadastral — voir `_adresses_commune`.
+        Utilisé à la fois par la découverte (`_parcelles_cadastrales_sans_adresse`)
+        et par le rattrapage qui nettoie les rues déjà vérifiées avant ce
+        changement (voir main.py::nettoyer_doublons_sans_adresse)."""
+        return any(_point_dans_polygone(x, y, rings) for x, y in self._adresses_commune(commune))
 
     # -- Découverte des rues et adresses (ICAR) -----------------------------
 
     def lister_rues(self, commune: str) -> List[str]:
-        """Toutes les rues connues du registre ICAR pour une commune."""
+        """Toutes les rues connues du registre ICAR pour une commune.
+
+        `order_by="ADR_ID"` : requête sans filtre géométrique ni RUE_NM,
+        donc potentiellement multi-pages pour une grande commune (vérifié
+        en conditions réelles sur Dour : 7976 adresses, 4 pages) — sans
+        tri explicite, la pagination ArcGIS n'est pas stable d'une page à
+        l'autre (voir ArcGISRestClient.query_layer), ce qui peut faire
+        disparaître des rues entières du résultat sans que rien ne le
+        signale (même nombre total de features, ensemble différent)."""
         features = self._client.query_layer(
             service_url=config.ARCGIS_SERVICES["ICAR_ADR_PT"],
             layer_id=_ICAR_ADRESSES_LAYER_ID,
             where=f"COM_NM = '{self._escape(commune)}'",
             out_fields="RUE_NM",
             return_geometry=False,
+            order_by="ADR_ID",
         )
         rues = sorted(
             {f["attributes"]["RUE_NM"] for f in features if f["attributes"].get("RUE_NM")}
@@ -317,15 +366,14 @@ class CadastreService:
                 if capakey and capakey not in capakeys_vus:
                     capakeys_vus[capakey] = feature
 
-        points_icar = [(p.x, p.y) for p in parcelles_icar if p.x is not None and p.y is not None]
         code_postal = self._code_postal_le_plus_frequent(parcelles_icar)
         segments = construire_segments(troncons)
 
         nouvelles: List[Parcelle] = []
         for capakey, feature in capakeys_vus.items():
             rings = (feature.get("geometry") or {}).get("rings", [])
-            if any(_point_dans_polygone(x, y, rings) for x, y in points_icar):
-                continue  # déjà couverte par une adresse ICAR
+            if self.a_une_adresse_ailleurs(commune, rings):
+                continue  # a déjà une adresse ICAR quelque part dans la commune
             attrs = feature["attributes"]
             parcelle = Parcelle(
                 pays=pays,
