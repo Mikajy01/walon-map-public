@@ -18,7 +18,7 @@ import sys
 import threading
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
-from typing import Optional
+from typing import Dict, Optional
 
 # Doit s'exécuter AVANT tout import de code utilisant potentiellement
 # stdout/stderr (ex: tqdm dans utils/progress.py, via main.py). Un
@@ -53,7 +53,7 @@ from utils.licence import charger_mot_de_passe_local, verifier_et_enregistrer
 from utils.logger import setup_logging
 from utils.rate_limiter import RateLimiter
 
-APP_TITLE = "Walonmap — Remplissage automatique"
+APP_TITLE = f"Walonmap — Remplissage automatique (v{config.APP_VERSION})"
 
 
 class _QueueLogHandler(logging.Handler):
@@ -522,6 +522,74 @@ class App(ctk.CTk):
 
     # -- Recalcul côté/position (rattrapage pour les parcelles déjà résolues) -
 
+    def _demander_forcer_redecouverte(self) -> Optional[bool]:
+        """Popup de confirmation avec case à cocher, affiché avant chaque
+        recalcul : demande si la redécouverte au rayon élargi doit être
+        refaite pour TOUTES les rues déjà vérifiées, y compris celles déjà
+        marquées comme redécouvertes lors d'un appel précédent (voir
+        main.py::recalculer_cote_position, paramètre `forcer_redecouverte`).
+
+        Nécessaire depuis qu'une rue une fois marquée n'est plus jamais
+        retentée — cas réel (Rue Baudouin 1er, Courcelles) : une rue
+        redécouverte avant l'élargissement du rayon à 200m ne retrouvait
+        plus jamais de nouvelles parcelles, même après mise à jour de
+        l'application, sans que rien ne le signale à l'utilisateur.
+
+        Renvoie `True`/`False` selon la case cochée si l'utilisateur
+        confirme, `None` s'il annule (le recalcul ne doit alors pas
+        démarrer)."""
+        resultat: Dict[str, Optional[bool]] = {"valeur": None}
+
+        fenetre = ctk.CTkToplevel(self)
+        fenetre.title(APP_TITLE)
+        fenetre.geometry("520x300")
+        fenetre.resizable(False, False)
+        fenetre.transient(self)
+        fenetre.grab_set()
+
+        ctk.CTkLabel(
+            fenetre, text="Options du recalcul", font=ctk.CTkFont(size=15, weight="bold"),
+        ).pack(anchor="w", padx=20, pady=(20, 8))
+
+        ctk.CTkLabel(
+            fenetre, wraplength=470, justify="left",
+            text=(
+                "Par défaut, une rue déjà redécouverte au rayon élargi lors d'un "
+                "recalcul précédent n'est plus jamais retentée — même après une "
+                "mise à jour de l'application qui changerait la recherche (rayon, "
+                "correctif de tracé...).\n\n"
+                "Cocher l'option ci-dessous force une nouvelle redécouverte pour "
+                "TOUTES les rues déjà vérifiées, pas seulement les nouvelles. "
+                "Aucune ligne déjà trouvée n'est supprimée — seulement complétée "
+                "si de nouvelles parcelles apparaissent."
+            ),
+        ).pack(anchor="w", padx=20, pady=(0, 8))
+
+        ctk.CTkLabel(
+            fenetre, wraplength=470, justify="left", text_color=("darkorange3", "orange"),
+            text="⚠ Nettement plus long qu'un recalcul normal — à cocher seulement en cas de doute concret.",
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        case_forcer = ctk.CTkCheckBox(fenetre, text="Redécouvrir toutes les rues déjà vérifiées")
+        case_forcer.pack(anchor="w", padx=20, pady=(0, 16))
+
+        def _valider() -> None:
+            resultat["valeur"] = bool(case_forcer.get())
+            fenetre.destroy()
+
+        def _annuler() -> None:
+            resultat["valeur"] = None
+            fenetre.destroy()
+
+        boutons = ctk.CTkFrame(fenetre, fg_color="transparent")
+        boutons.pack(fill="x", padx=20, pady=(0, 20))
+        ctk.CTkButton(boutons, text="Annuler", fg_color="gray40", command=_annuler).pack(side="right")
+        ctk.CTkButton(boutons, text="Lancer le recalcul", command=_valider).pack(side="right", padx=(0, 8))
+
+        fenetre.protocol("WM_DELETE_WINDOW", _annuler)
+        self.wait_window(fenetre)
+        return resultat["valeur"]
+
     def _recalculer_cote_position(self) -> None:
         """Rattrapage géométrique à lancer une fois par commune — voir
         main.py::recalculer_cote_position pour le détail des corrections
@@ -556,6 +624,10 @@ class App(ctk.CTk):
         if not self._verifier_licence(commune):
             return
 
+        forcer_redecouverte = self._demander_forcer_redecouverte()
+        if forcer_redecouverte is None:
+            return
+
         self._en_cours = True
         self.bouton_lancer.configure(state="disabled")
         self.bouton_importer_corrige.configure(state="disabled")
@@ -573,7 +645,7 @@ class App(ctk.CTk):
             target=self._executer_recalcul_cote_position,
             args=(
                 commune, Path(fichier_entree), Path(fichier_sortie), self.slider_vitesse.get(),
-                _parse_codes_postaux(self.entry_codes_postaux.get()),
+                _parse_codes_postaux(self.entry_codes_postaux.get()), forcer_redecouverte,
             ),
             daemon=True,
         )
@@ -581,7 +653,7 @@ class App(ctk.CTk):
 
     def _executer_recalcul_cote_position(
         self, commune: str, fichier_entree: Path, fichier_sortie: Path, rate_limit: float,
-        codes_postaux: Optional[list] = None,
+        codes_postaux: Optional[list] = None, forcer_redecouverte: bool = False,
     ) -> None:
         """Tourne dans un thread d'arrière-plan, comme `_executer` : voir
         main.py::recalculer_cote_position pour la logique elle-même
@@ -589,7 +661,9 @@ class App(ctk.CTk):
         traitement normal) restreint le rattrapage à ces codes postaux —
         indispensable pour une commune fusionnée dont on ne gère qu'un
         sous-ensemble des codes postaux (ex: Comines-Warneton), sans quoi
-        le rattrapage touche toute la commune (incident réel constaté)."""
+        le rattrapage touche toute la commune (incident réel constaté).
+        `forcer_redecouverte` vient de la case à cocher du popup affiché par
+        `_recalculer_cote_position` (voir `_demander_forcer_redecouverte`)."""
         try:
             cache_service = CacheService(config.CACHE_DIR)
             progress_store = ProgressStore(config.CACHE_DIR)
@@ -605,6 +679,7 @@ class App(ctk.CTk):
             n = recalculer_cote_position(
                 commune, cadastre_service, progress_store, excel_service,
                 output_path=fichier_sortie, codes_postaux=codes_postaux, on_progress=on_progress,
+                forcer_redecouverte=forcer_redecouverte,
             )
             self._message_queue.put(("recalcul_done", n, fichier_sortie))
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI

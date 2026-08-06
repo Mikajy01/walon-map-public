@@ -37,13 +37,28 @@ echo.
 echo Nettoyage des builds precedents...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
-if exist Walonmap.spec del /q Walonmap.spec
+del /q Walonmap*.spec >nul 2>nul
+
+echo.
+echo Lecture du numero de version (config.APP_VERSION)...
+REM Inclus dans le nom de l'executable pour qu'un collaborateur ne se
+REM retrouve jamais a utiliser une ancienne version sans le savoir (une rue
+REM deja marquee "redecouverte" par une ancienne version, par exemple, ne
+REM profite d'aucun correctif ulterieur tant que l'app n'est pas mise a
+REM jour - voir config.py::APP_VERSION et gui.py::APP_TITLE, qui l'affiche
+REM aussi dans le titre de la fenetre).
+for /f %%v in ('.venv_build\Scripts\python.exe -c "import config; print(config.APP_VERSION)"') do set APP_VERSION=%%v
+if not defined APP_VERSION (
+    echo [ERREUR] Impossible de lire config.APP_VERSION.
+    exit /b 1
+)
+echo Version : %APP_VERSION%
 
 echo.
 echo Construction de l'executable (PyInstaller --onefile --windowed)...
 REM --collect-all customtkinter : embarque les fichiers de theme JSON de la
 REM bibliotheque, qu'une analyse PyInstaller standard ne detecte pas seule.
-.venv_build\Scripts\pyinstaller.exe --onefile --windowed --name Walonmap --collect-all customtkinter gui.py
+.venv_build\Scripts\pyinstaller.exe --onefile --windowed --name Walonmap-%APP_VERSION% --collect-all customtkinter gui.py
 if errorlevel 1 (
     echo [ERREUR] Echec de la construction PyInstaller.
     exit /b 1
@@ -58,7 +73,7 @@ if exist data\liens_communaux.csv (
 
 echo.
 echo === Termine ===
-echo Executable portable : dist\Walonmap.exe
+echo Executable portable : dist\Walonmap-%APP_VERSION%.exe
 echo.
 echo Pour distribuer l'application, copiez tout le dossier "dist" (l'exe et
 echo son dossier data\) sur la machine cible. Les dossiers cache\, logs\ et

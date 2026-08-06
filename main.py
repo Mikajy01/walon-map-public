@@ -161,6 +161,17 @@ def parse_args() -> argparse.Namespace:
              "des codes postaux, ex: Comines-Warneton).",
     )
     parser.add_argument(
+        "--forcer-redecouverte", action="store_true",
+        help="Avec --recalculer-cote-position : refait la redécouverte au "
+             "rayon élargi pour TOUTES les rues déjà vérifiées, y compris "
+             "celles déjà marquées redécouvertes lors d'un appel précédent "
+             "(sans ce forçage, une rue déjà marquée n'est plus jamais "
+             "retentée, même après une mise à jour de l'application qui "
+             "changerait la recherche). Ne supprime jamais rien, seulement "
+             "plus lent qu'un recalcul normal — à réserver à un doute "
+             "concret (ex: rue traitée avec une ancienne version de l'app).",
+    )
+    parser.add_argument(
         "--retraiter-echecs", action="store_true",
         help="Rattrapage, au lieu du traitement normal : retente UNIQUEMENT les "
              "parcelles enregistrées en échec lors d'une exécution précédente "
@@ -528,6 +539,7 @@ def recalculer_cote_position(
     output_path: Optional[Path] = None,
     codes_postaux: Optional[List[str]] = None,
     on_progress: Optional[ProgressCallback] = None,
+    forcer_redecouverte: bool = False,
 ) -> int:
     """Rattrapage géométrique unique, à lancer une fois par commune, qui
     corrige en une passe tout ce qui a changé après coup dans le calcul
@@ -584,7 +596,25 @@ def recalculer_cote_position(
     responsable (incident réel constaté : collaboratrice en charge de
     Courcelles/6180 uniquement, correction remontée jusqu'à 6183). Une
     rue/parcelle dont le code postal n'est pas encore connu (jamais
-    résolue) n'est par prudence jamais sautée, comme dans `traiter_commune`."""
+    résolue) n'est par prudence jamais sautée, comme dans `traiter_commune`.
+
+    `forcer_redecouverte`, si True, refait l'étape 1 pour TOUTES les rues déjà
+    vérifiées, y compris celles déjà marquées "redécouvertes avec le rayon
+    élargi" lors d'un appel précédent — sans ce forçage, une rue déjà marquée
+    n'est plus jamais retentée, même après une mise à jour de l'application
+    qui changerait la logique de découverte (rayon élargi, correctif de
+    tracé, etc. — voir `CadastreService._RAYON_RECHERCHE_PARCELLES_M`). Cas
+    réel : Rue Baudouin 1er (Courcelles), déjà marquée redécouverte avant
+    l'élargissement du rayon à 200m, ne retrouvait plus jamais 6 parcelles
+    pourtant à moins de 51m du tracé tant que ce forçage n'existait pas.
+    Ne supprime jamais rien : `_parcelles_cadastrales_sans_adresse` fusionne
+    toujours ses résultats avec l'existant (INSERT OR REPLACE par parcelle),
+    ne purge jamais — une rue déjà correctement découverte ne perd aucune
+    ligne en étant redécouverte une fois de plus, elle est seulement
+    recomparée à la recherche actuelle. Nettement plus coûteux qu'un
+    recalcul normal (refait l'étape 1 pour des rues qui n'en avaient pas
+    besoin) : à réserver à un doute concret plutôt qu'à un usage
+    systématique."""
     total_corrections = 0
     segments_par_rue: Dict[str, list] = {}
 
@@ -619,10 +649,11 @@ def recalculer_cote_position(
     # sans effet lors d'une relance sur une commune déjà redécouverte —
     # sans ce suivi, elle repayerait le coût de la redécouverte (~2 min/rue
     # observé en conditions réelles) à chaque exécution du rattrapage, pour
-    # ne jamais rien retrouver de nouveau.
+    # ne jamais rien retrouver de nouveau. `forcer_redecouverte` ignore ce
+    # marqueur et retente TOUTES les rues déjà vérifiées (voir docstring).
     rues_a_redecouvrir = [
         rue for rue in progress_store.rues_verifiees_commune(commune)
-        if not progress_store.rue_redecouverte_rayon_elargi(commune, rue)
+        if forcer_redecouverte or not progress_store.rue_redecouverte_rayon_elargi(commune, rue)
     ]
     for rue_index, rue in enumerate(rues_a_redecouvrir):
         if on_progress:
@@ -968,6 +999,7 @@ def main() -> int:
                 recalculer_cote_position(
                     commune, cadastre_service, progress_store, excel_service,
                     output_path=output_path, codes_postaux=args.codes_postaux,
+                    forcer_redecouverte=args.forcer_redecouverte,
                 )
                 recalcul_reussi = True
                 continue
