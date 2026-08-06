@@ -488,13 +488,29 @@ class CadastreService:
                 service_url=config.ARCGIS_SERVICES["CADMAP_PARCELLES"],
                 layer_id=_CADMAP_LAYER_ID,
                 geometry=enveloppe, geometry_type="esriGeometryPolygon",
-                out_fields="CAPAKEY,RADICAL,BIS,EXPOSANT,PUISSANCE",
+                out_fields="CAPAKEY,RADICAL,BIS,EXPOSANT,PUISSANCE,NOM_COMMUNE",
                 return_geometry=True,
             )
             for feature in features:
-                capakey = feature["attributes"].get("CAPAKEY")
-                if capakey and capakey not in capakeys_vus:
-                    capakeys_vus[capakey] = feature
+                attrs = feature["attributes"]
+                capakey = attrs.get("CAPAKEY")
+                if not capakey or capakey in capakeys_vus:
+                    continue
+                # La fenêtre de recherche (200m) déborde souvent dans une
+                # commune voisine pour une rue proche de la frontière
+                # communale — vérifié en conditions réelles (Dour) : les 4
+                # coins de son étendue connue trouvent des parcelles
+                # d'Honnelles, Hensies, Frameries et Colfontaine, pas
+                # seulement Dour. `a_une_adresse_ailleurs`/`rue_la_plus_proche`
+                # ci-dessous ne comparent qu'à l'intérieur de `commune` : une
+                # parcelle réellement voisine (aucune adresse ICAR ni rue
+                # plus proche connue DANS `commune`, pour cause) passerait ces
+                # deux filtres sans être exclue. `NOM_COMMUNE` (disponible sur
+                # la couche CADMAP mais jamais demandé jusqu'ici) tranche
+                # directement, avant même ces vérifications plus coûteuses.
+                if (attrs.get("NOM_COMMUNE") or "").strip().lower() != commune.strip().lower():
+                    continue
+                capakeys_vus[capakey] = feature
 
         code_postal = self._code_postal_le_plus_frequent(parcelles_icar)
         segments = construire_segments(troncons, point_reference=point_reference)
