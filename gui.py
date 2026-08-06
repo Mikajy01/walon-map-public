@@ -443,7 +443,7 @@ class App(ctk.CTk):
             logging.getLogger("gui").exception("Échec du traitement")
             self._message_queue.put(("error", str(exc)))
 
-    # -- Import d'un Excel corrigé (reprise des cellules ERREUR) -------------
+    # -- Import d'un Excel corrigé (reprise des cellules ERREUR/vides) -------
 
     def _importer_excel_corrige(self) -> None:
         if self._en_cours:

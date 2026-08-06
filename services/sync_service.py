@@ -4,12 +4,18 @@ corrigé ou complété à la main — avec la progression enregistrée
 
 Deux cas traités :
 1. Ligne déjà connue en base (reconnue par Rue + Numéro + Numéro
-   cadastral) : seules les colonnes valant actuellement `"ERREUR"` sont
-   corrigées si l'Excel a maintenant une vraie valeur (voir
+   cadastral) : seules les colonnes valant actuellement `"ERREUR"` OU vides
+   sont corrigées si l'Excel a maintenant une vraie valeur (voir
    `services/layers_service.py`, qui gèle `"ERREUR"` pour toujours une fois
-   la parcelle marquée traitée). Aucune autre colonne n'est jamais touchée,
-   même si elle diffère de l'Excel — une frappe accidentelle de
-   l'utilisateur ne doit jamais corrompre une donnée déjà correcte.
+   la parcelle marquée traitée ; le cas vide couvre une ligne ajoutée à la
+   main dans l'Excel — voir cas 2 ci-dessous — dont une colonne G+ avait été
+   laissée vide lors de l'ajout, copiée telle quelle en base). Aucune autre
+   colonne n'est jamais touchée, même si elle diffère de l'Excel — une
+   frappe accidentelle de l'utilisateur ne doit jamais corrompre une donnée
+   déjà correcte. Sans risque : aucune règle du moteur (`layers_service.py`)
+   ne produit jamais légitimement une chaîne vide (toujours O/N/ERREUR/une
+   valeur fixe comme "/"), donc une cellule vide en base n'est jamais une
+   vraie valeur à préserver.
 2. Ligne PAS encore en base (ex: l'utilisateur a ajouté une parcelle à la
    main dans l'Excel) : avant de l'ajouter, son existence réelle est
    vérifiée au registre ICAR (rue puis numéro) — jamais de donnée
@@ -71,7 +77,7 @@ class RapportSynchronisation:
         msg = (
             f"{self.lignes_excel} ligne(s) lues dans l'Excel importé, "
             f"{self.lignes_reconnues} déjà connue(s) en base ({self.cellules_corrigees} "
-            f"cellule(s) 'ERREUR' corrigée(s)), {self.lignes_ajoutees} nouvelle(s) "
+            f"cellule(s) 'ERREUR'/vide(s) corrigée(s)), {self.lignes_ajoutees} nouvelle(s) "
             f"parcelle(s) ajoutée(s) à la base (existence vérifiée au registre ICAR), "
             f"{self.lignes_doublons} doublon(s) détecté(s) (déjà en base sous un "
             f"identifiant réel malgré un texte différent — traité(s) comme correction), "
@@ -92,18 +98,29 @@ def _corriger_cellules_erreur(
     valeurs_base: Dict[str, str], ligne: Dict[str, str], column_order: List[str],
     identifiant: str, rapport: RapportSynchronisation,
 ) -> bool:
-    """Corrige dans `valeurs_base` toute colonne valant `"ERREUR"` pour
-    laquelle `ligne` (Excel) a une valeur différente et non vide. Renvoie
-    True si au moins une cellule a changé."""
+    """Corrige dans `valeurs_base` toute colonne valant `"ERREUR"` ou vide
+    pour laquelle `ligne` (Excel) a une valeur différente et non vide.
+    Renvoie True si au moins une cellule a changé.
+
+    Le cas vide couvre une ligne ajoutée à la main dans l'Excel (voir
+    `synchroniser_depuis_excel`, colonnes G+ reprises telles quelles depuis
+    l'Excel) dont une colonne avait été laissée vide lors de l'ajout, puis
+    copiée telle quelle en base — jamais retentée automatiquement sinon,
+    contrairement à `"ERREUR"` (voir `layers_service.retry_erreurs`). Sans
+    risque : aucune règle du moteur (`layers_service.py`) ne produit jamais
+    légitimement une chaîne vide (toujours O/N/ERREUR/une valeur fixe comme
+    "/"), donc une cellule vide en base n'est jamais une vraie valeur à
+    préserver."""
     changed = False
     for col in column_order:
-        if valeurs_base.get(col) != "ERREUR":
+        valeur_actuelle = valeurs_base.get(col)
+        if valeur_actuelle != "ERREUR" and valeur_actuelle:
             continue
         nouvelle_valeur = ligne.get(col, "")
         if nouvelle_valeur and nouvelle_valeur != "ERREUR":
             _logger.info(
                 "Parcelle %s | colonne %s : correction manuelle reprise "
-                "depuis l'Excel importé ('ERREUR' -> %r).", identifiant, col, nouvelle_valeur,
+                "depuis l'Excel importé (%r -> %r).", identifiant, col, valeur_actuelle, nouvelle_valeur,
             )
             valeurs_base[col] = nouvelle_valeur
             changed = True
