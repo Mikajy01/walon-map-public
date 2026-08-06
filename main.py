@@ -52,13 +52,24 @@ class ResultatTraitement:
     GUI) de savoir s'il reste des adresses à traiter, sans avoir à relire
     les logs. `total_adresses`/`restantes` sont relatifs au périmètre de
     cette exécution (toute la commune, ou seulement le(s) code(s) postal
-    (aux) filtré(s) si `--code-postal` était utilisé — voir `filtre_actif`)."""
+    (aux) filtré(s) si `--code-postal` était utilisé — voir `filtre_actif`).
+
+    `echecs` : nombre de parcelles qui ont échoué PENDANT cette exécution et
+    ont été automatiquement remplacées par la suivante dans la file pour ne
+    pas faire baisser le total obtenu (voir `_traiter_jusqu_a_objectif`) —
+    jamais enregistrées comme traitées, donc jamais perdues, seulement
+    reportées au prochain lancement. Exposé ici (plutôt que seulement
+    journalisé) pour que l'appelant (GUI) puisse le mettre en évidence dans
+    le résumé final plutôt que de le laisser uniquement dans le journal qui
+    défile — demandé après qu'un utilisateur ait douté que ce décompte soit
+    vraiment signalé quelque part."""
 
     output_path: Path
     total_adresses: int
     parcelles_resolues: int
     restantes: int
     filtre_actif: bool
+    echecs: int = 0
 
     @property
     def termine(self) -> bool:
@@ -444,8 +455,8 @@ def traiter_commune(
         if on_progress:
             on_progress("remplissage", parcelle_index + 1, cible)
 
-    if parcelles_tentees > len(nouvellement_traitees):
-        echecs = parcelles_tentees - len(nouvellement_traitees)
+    echecs = parcelles_tentees - len(nouvellement_traitees)
+    if echecs > 0:
         _logger.info(
             "Commune '%s' : %d parcelle(s) tentée(s) pour obtenir %d nouvelle(s) réussie(s) "
             "(%d échec(s) remplacé(s) automatiquement).",
@@ -493,6 +504,7 @@ def traiter_commune(
         parcelles_resolues=len(parcelles_resolues),
         restantes=restantes,
         filtre_actif=bool(codes_postaux),
+        echecs=echecs,
     )
 
 
@@ -1021,6 +1033,11 @@ def main() -> int:
 
     for resultat in resultats:
         _logger.info("Fichier généré : %s", resultat.output_path)
+        if resultat.echecs > 0:
+            _logger.info(
+                "%d échec(s) pendant cette exécution — pas perdus, retentés automatiquement "
+                "au prochain lancement.", resultat.echecs,
+            )
         if resultat.termine:
             _logger.info(
                 "Commune terminée : plus aucune adresse à traiter%s.",

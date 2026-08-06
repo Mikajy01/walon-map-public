@@ -889,8 +889,26 @@ class App(ctk.CTk):
                     f"Terminé pour cette exécution — {resultat.restantes} adresse(s) restante(s) sur "
                     f"{resultat.total_adresses} (relancez pour continuer). Fichier généré : {resultat.output_path}"
                 )
+            # Mentionné explicitement dans le résumé (pas seulement dans le
+            # journal qui défile, où c'était auparavant facile à manquer —
+            # voir main.py::ResultatTraitement.echecs) : rassure sans avoir
+            # à faire défiler le journal pour retrouver l'information.
+            if resultat.echecs > 0:
+                statut += (
+                    f" — {resultat.echecs} échec(s) pendant cette exécution, pas perdu(s), "
+                    f"retenté(s) automatiquement au prochain lancement."
+                )
             self.label_statut.configure(text=statut)
             self.bouton_ouvrir_dossier.configure(state="normal")
+            if resultat.echecs > 0:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    f"Traitement terminé, mais {resultat.echecs} parcelle(s) ont échoué pendant "
+                    f"cette exécution (incident réseau transitoire, généralement).\n\n"
+                    f"Rien n'est perdu : une parcelle en échec n'est jamais enregistrée comme "
+                    f"traitée, elle sera automatiquement redétectée et retentée au prochain "
+                    f"lancement — aucune action manuelle n'est nécessaire.",
+                )
         else:
             self.label_statut.configure(text="Échec du traitement — voir le journal ci-dessous.")
             messagebox.showerror(APP_TITLE, f"Le traitement a échoué :\n{erreur}")
