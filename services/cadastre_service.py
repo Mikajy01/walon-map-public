@@ -639,6 +639,25 @@ class CadastreService:
         parcelle.numero_cadastral = self._format_numero_cadastral(attrs)
         parcelle.geometry = features[0].get("geometry")
 
+    def commune_reelle(self, capakey: str) -> Optional[str]:
+        """NOM_COMMUNE CADMAP réel d'une parcelle déjà identifiée par son
+        capakey — sert au rattrapage qui retire les parcelles "sans
+        adresse" ajoutées à tort depuis une commune voisine (voir
+        main.py::recalculer_cote_position), pour des parcelles découvertes
+        AVANT le filtre par commune ajouté à
+        `_parcelles_cadastrales_sans_adresse`. `None` si la parcelle n'est
+        plus trouvée (rare, ex: fusion/mise à jour cadastrale)."""
+        features = self._client.query_layer(
+            service_url=config.ARCGIS_SERVICES["CADMAP_PARCELLES"],
+            layer_id=_CADMAP_LAYER_ID,
+            where=f"CAPAKEY = '{self._escape(capakey)}'",
+            out_fields="NOM_COMMUNE",
+            return_geometry=False,
+        )
+        if not features:
+            return None
+        return features[0]["attributes"].get("NOM_COMMUNE")
+
     @staticmethod
     def _format_numero_cadastral(attrs: Dict[str, Any]) -> str:
         """Reconstitue le numéro cadastral lisible à partir des champs bruts

@@ -593,6 +593,17 @@ def recalculer_cote_position(
        `utils/geometrie.py::distance_min_polygone_rue`), retire les autres.
        Nettoie aussi bien les doublons hérités d'avant ce rattrapage que
        ceux introduits par l'étape 1 elle-même (volontairement en dernier).
+    6. Retire les parcelles "sans adresse" qui appartiennent en réalité à
+       une commune VOISINE (voir `CadastreService.commune_reelle`, champ
+       NOM_COMMUNE de CADMAP) — la recherche par rayon de l'étape 1
+       n'avait, avant ce correctif, aucun filtre de commune côté CADMAP
+       (contrairement à ICAR/PICC) : une rue proche d'une frontière
+       communale pouvait récupérer des parcelles d'une commune voisine, non
+       détectées par les étapes 4/5 ci-dessus qui ne comparent qu'À
+       L'INTÉRIEUR de la commune traitée. Cas réel : "Rue de la Frontière"
+       (Dour), 20 parcelles de Frameries ajoutées à tort. Un appel réseau
+       par parcelle sans-adresse déjà connue, suivi par rue comme les
+       étapes coûteuses ci-dessus.
 
     Les parcelles traitées normalement (`traiter_commune`) depuis l'ajout
     de ces vérifications n'ont déjà plus ces problèmes ; relancer ceci ne
@@ -862,17 +873,52 @@ def recalculer_cote_position(
             )
             total_corrections += 1
 
+    # -- 6. Parcelles "sans adresse" appartenant en réalité à une commune
+    # voisine (recherche par rayon avant le filtre NOM_COMMUNE ajouté à
+    # `_parcelles_cadastrales_sans_adresse` — cas réel : "Rue de la
+    # Frontière", Dour, 20 parcelles de Frameries ajoutées à tort). Un
+    # appel réseau par parcelle (pas de raccourci géométrique possible),
+    # donc suivi par rue comme les étapes coûteuses ci-dessus pour ne
+    # jamais revérifier une rue déjà propre.
+    rues_a_verifier_commune = [
+        rue for rue in progress_store.rues_verifiees_commune(commune)
+        if not progress_store.rue_commune_verifiee(commune, rue)
+    ]
+    for rue_index, rue in enumerate(rues_a_verifier_commune):
+        if on_progress:
+            on_progress("nettoyage_commune_voisine", rue_index + 1, len(rues_a_verifier_commune))
+        filtre_a_ignore_une_entree = False
+        for entree in progress_store.parcelles_sans_adresse(commune, rue):
+            if codes_postaux is not None and entree.get("code_postal") not in codes_postaux:
+                filtre_a_ignore_une_entree = True
+                continue
+            capakey = entree["capakey"]
+            commune_reelle = cadastre_service.commune_reelle(capakey)
+            if commune_reelle is None or commune_reelle.strip().lower() == commune.strip().lower():
+                continue
+            progress_store.supprimer_parcelle_sans_adresse(commune, rue, capakey)
+            progress_store.supprimer_resultat(commune, f"{commune}|CAPAKEY:{capakey}")
+            _logger.info(
+                "Commune '%s' : parcelle %s (rue '%s') retirée — appartient en réalité à la "
+                "commune '%s'.", commune, capakey, rue, commune_reelle,
+            )
+            total_corrections += 1
+        if not filtre_a_ignore_une_entree:
+            progress_store.marquer_rue_commune_verifiee(commune, rue)
+
     if total_corrections:
         _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
         _logger.info(
             "Commune '%s' : %d correction(s) géométrique(s) appliquée(s) (nouvelles parcelles "
             "au rayon élargi, tronçons recollés, côté/position, doublons adresse ailleurs, "
-            "doublons rue la plus proche confondus).", commune, total_corrections,
+            "doublons rue la plus proche, parcelles d'une commune voisine confondus).",
+            commune, total_corrections,
         )
     else:
         _logger.info(
             "Commune '%s' : rien à corriger (aucune nouvelle parcelle au rayon élargi, aucune "
-            "parcelle sans côté/position, aucun doublon détecté).", commune,
+            "parcelle sans côté/position, aucun doublon détecté, aucune parcelle d'une commune "
+            "voisine détectée).", commune,
         )
     return total_corrections
 

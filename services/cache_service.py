@@ -220,6 +220,26 @@ class ProgressStore:
                 )
                 """
             )
+            # Marque les rues dont les parcelles sans adresse ont déjà été
+            # vérifiées contre la commune CADMAP réelle (NOM_COMMUNE) de
+            # chaque parcelle (voir main.py::recalculer_cote_position) —
+            # rattrapage pour les parcelles ajoutées à tort AVANT le
+            # correctif de CadastreService._parcelles_cadastrales_sans_adresse
+            # (recherche par rayon sans filtre de commune : une rue proche
+            # d'une frontière communale pouvait récupérer des parcelles
+            # d'une commune voisine, cas réel vérifié à Dour/Frameries). Même
+            # nécessité qu'avec les tables ci-dessus : une vérification par
+            # parcelle nécessite un appel réseau, à ne jamais refaire pour
+            # une rue déjà vérifiée.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rues_communes_verifiees (
+                    commune TEXT NOT NULL,
+                    rue TEXT NOT NULL,
+                    PRIMARY KEY (commune, rue)
+                )
+                """
+            )
             conn.commit()
 
     def rue_deja_verifiee(self, commune: str, rue: str) -> bool:
@@ -276,6 +296,25 @@ class ProgressStore:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO rues_geometrie_recollee (commune, rue) VALUES (?, ?)",
+                (commune, rue),
+            )
+            conn.commit()
+
+    def rue_commune_verifiee(self, commune: str, rue: str) -> bool:
+        """True si les parcelles sans adresse de cette rue ont déjà été
+        vérifiées contre leur commune CADMAP réelle (voir
+        main.py::recalculer_cote_position)."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM rues_communes_verifiees WHERE commune = ? AND rue = ?",
+                (commune, rue),
+            ).fetchone()
+        return row is not None
+
+    def marquer_rue_commune_verifiee(self, commune: str, rue: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO rues_communes_verifiees (commune, rue) VALUES (?, ?)",
                 (commune, rue),
             )
             conn.commit()
