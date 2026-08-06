@@ -48,7 +48,14 @@ from services.cadastre_service import CadastreService
 from services.excel_service import ExcelService
 from services.geoportail_service import ArcGISRestClient
 from services.layers_service import LayersService
-from services.sync_service import RapportSynchronisation, reecrire_excel_depuis_base, synchroniser_depuis_excel
+from services.sync_service import (
+    PlanSynchronisation,
+    RapportSynchronisation,
+    appliquer_plan_synchronisation,
+    calculer_synchronisation,
+    reecrire_excel_depuis_base,
+    synchroniser_depuis_excel,
+)
 from utils.licence import charger_mot_de_passe_local, verifier_et_enregistrer
 from utils.logger import setup_logging
 from utils.rate_limiter import RateLimiter
@@ -300,6 +307,8 @@ class App(ctk.CTk):
             self._fin_synchronisation(rapport=message[1], chemin=message[2])
         elif kind == "sync_done_verrouille":
             self._fin_synchronisation(rapport=message[1], chemin=message[2], fichier_verrouille=True)
+        elif kind == "sync_preview":
+            self._gerer_apercu_synchronisation_miroir(*message[1:])
         elif kind == "recalcul_done":
             self._fin_recalcul(n=message[1], chemin=message[2])
         elif kind == "retraitement_echecs_done":
@@ -445,6 +454,83 @@ class App(ctk.CTk):
 
     # -- Import d'un Excel corrigé (reprise des cellules ERREUR/vides) -------
 
+    def _demander_mode_synchronisation(self) -> Optional[bool]:
+        """Popup de confirmation avec case à cocher, affiché avant chaque
+        import — même principe que `_demander_forcer_redecouverte` : demande
+        si la synchronisation doit être "complète" (miroir) plutôt que le
+        mode par défaut.
+
+        Mode par défaut (décoché) : seules les cellules ERREUR/vides sont
+        reprises depuis l'Excel, aucune ligne n'est jamais supprimée — voir
+        `services/sync_service.py`.
+
+        Mode miroir (coché) : reprend TOUTE cellule différente (même si la
+        base avait déjà une vraie valeur), et supprime toute ligne de la
+        commune absente de l'Excel importé — demandé par des collaborateurs
+        qui corrigent une cellule déjà remplie ou suppriment une ligne
+        directement dans l'Excel. Un aperçu chiffré et une confirmation par
+        saisie du nom de la commune suivent avant toute écriture réelle
+        (voir `_gerer_apercu_synchronisation_miroir`) — rien n'est modifié
+        rien qu'en cochant cette case.
+
+        Renvoie `True`/`False` selon la case cochée si l'utilisateur
+        confirme, `None` s'il annule (l'import ne doit alors pas
+        démarrer)."""
+        resultat: Dict[str, Optional[bool]] = {"valeur": None}
+
+        fenetre = ctk.CTkToplevel(self)
+        fenetre.title(APP_TITLE)
+        fenetre.geometry("540x300")
+        fenetre.resizable(False, False)
+        fenetre.transient(self)
+        fenetre.grab_set()
+
+        ctk.CTkLabel(
+            fenetre, text="Options de la synchronisation", font=ctk.CTkFont(size=15, weight="bold"),
+        ).pack(anchor="w", padx=20, pady=(20, 8))
+
+        ctk.CTkLabel(
+            fenetre, wraplength=490, justify="left",
+            text=(
+                "Par défaut, seules les cellules en erreur ou vides sont reprises depuis "
+                "l'Excel importé — une cellule qui avait déjà une vraie valeur n'est jamais "
+                "écrasée, et aucune ligne n'est jamais supprimée.\n\n"
+                "Cocher l'option ci-dessous active une synchronisation COMPLÈTE (miroir) : "
+                "toute cellule différente est reprise depuis l'Excel (même si elle avait déjà "
+                "une valeur), et toute ligne de la commune absente de l'Excel importé est "
+                "supprimée définitivement de la base."
+            ),
+        ).pack(anchor="w", padx=20, pady=(0, 8))
+
+        ctk.CTkLabel(
+            fenetre, wraplength=490, justify="left", text_color=("darkorange3", "orange"),
+            text=(
+                "⚠ Un aperçu chiffré (lignes ajoutées/modifiées/supprimées) et une "
+                "confirmation par saisie du nom de la commune seront demandés avant toute "
+                "modification réelle — rien n'est appliqué en cochant simplement cette case."
+            ),
+        ).pack(anchor="w", padx=20, pady=(0, 12))
+
+        case_miroir = ctk.CTkCheckBox(fenetre, text="Synchronisation complète (miroir)")
+        case_miroir.pack(anchor="w", padx=20, pady=(0, 16))
+
+        def _valider() -> None:
+            resultat["valeur"] = bool(case_miroir.get())
+            fenetre.destroy()
+
+        def _annuler() -> None:
+            resultat["valeur"] = None
+            fenetre.destroy()
+
+        boutons = ctk.CTkFrame(fenetre, fg_color="transparent")
+        boutons.pack(fill="x", padx=20, pady=(0, 20))
+        ctk.CTkButton(boutons, text="Annuler", fg_color="gray40", command=_annuler).pack(side="right")
+        ctk.CTkButton(boutons, text="Continuer", command=_valider).pack(side="right", padx=(0, 8))
+
+        fenetre.protocol("WM_DELETE_WINDOW", _annuler)
+        self.wait_window(fenetre)
+        return resultat["valeur"]
+
     def _importer_excel_corrige(self) -> None:
         if self._en_cours:
             return
@@ -465,6 +551,10 @@ class App(ctk.CTk):
         if not chemin:
             return
 
+        mode_miroir = self._demander_mode_synchronisation()
+        if mode_miroir is None:
+            return
+
         self._en_cours = True
         self.bouton_lancer.configure(state="disabled")
         self.bouton_importer_corrige.configure(state="disabled", text="Importation en cours…")
@@ -473,14 +563,22 @@ class App(ctk.CTk):
         self.bouton_supprimer_hors_code_postal.configure(state="disabled")
         self.bouton_ouvrir_dossier.configure(state="disabled")
         self.barre_progression.set(0)
-        self.label_statut.configure(text="Importation et synchronisation en cours…")
+        self.label_statut.configure(
+            text="Calcul de la synchronisation miroir en cours…" if mode_miroir
+            else "Importation et synchronisation en cours…",
+        )
         self.zone_log.configure(state="normal")
         self.zone_log.delete("1.0", "end")
         self.zone_log.configure(state="disabled")
 
-        thread = threading.Thread(
-            target=self._executer_synchronisation, args=(commune, pays, Path(chemin)), daemon=True,
-        )
+        if mode_miroir:
+            thread = threading.Thread(
+                target=self._executer_calcul_synchronisation, args=(commune, pays, Path(chemin)), daemon=True,
+            )
+        else:
+            thread = threading.Thread(
+                target=self._executer_synchronisation, args=(commune, pays, Path(chemin)), daemon=True,
+            )
         thread.start()
 
     def _executer_synchronisation(self, commune: str, pays: str, chemin: Path) -> None:
@@ -490,7 +588,9 @@ class App(ctk.CTk):
         sert à vérifier au registre ICAR l'existence de toute ligne de
         l'Excel absente de la base avant de l'y ajouter (voir
         sync_service.py) — jamais de donnée inventée à partir du seul
-        texte de l'Excel."""
+        texte de l'Excel. Mode par défaut uniquement (case "synchronisation
+        complète" décochée) — voir `_executer_calcul_synchronisation` pour
+        le mode miroir, qui nécessite un aperçu avant application."""
         try:
             cache_service = CacheService(config.CACHE_DIR)
             progress_store = ProgressStore(config.CACHE_DIR)
@@ -518,6 +618,102 @@ class App(ctk.CTk):
             self._message_queue.put(("sync_done", rapport, chemin))
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
             logging.getLogger("gui").exception("Échec de l'importation/synchronisation")
+            self._message_queue.put(("error", str(exc)))
+
+    def _executer_calcul_synchronisation(self, commune: str, pays: str, chemin: Path) -> None:
+        """Tourne dans un thread d'arrière-plan : calcule une
+        synchronisation en mode miroir SANS rien écrire en base (voir
+        `sync_service.calculer_synchronisation`) — nécessaire pour afficher
+        un aperçu chiffré avant confirmation (mode miroir uniquement,
+        potentiellement destructeur). Le plan calculé revient via la queue
+        pour être présenté sur le fil principal (voir
+        `_gerer_apercu_synchronisation_miroir`) ; l'application réelle
+        n'a lieu qu'après confirmation explicite."""
+        try:
+            cache_service = CacheService(config.CACHE_DIR)
+            progress_store = ProgressStore(config.CACHE_DIR)
+            client = ArcGISRestClient(
+                cache=cache_service, rate_limiter=RateLimiter(config.MAX_REQUESTS_PER_SECOND),
+                timeout=config.HTTP_TIMEOUT_SECONDS,
+            )
+            cadastre_service = CadastreService(client, progress_store)
+            excel_service = ExcelService(chemin)
+            wb = excel_service.load_output_workbook()
+            ws = excel_service.get_active_sheet(wb)
+
+            plan = calculer_synchronisation(
+                commune, pays, ws, excel_service, progress_store, cadastre_service, mode_miroir=True,
+            )
+            self._message_queue.put(("sync_preview", plan, progress_store, excel_service, chemin))
+        except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
+            logging.getLogger("gui").exception("Échec du calcul de la synchronisation miroir")
+            self._message_queue.put(("error", str(exc)))
+
+    def _gerer_apercu_synchronisation_miroir(
+        self, plan: PlanSynchronisation, progress_store: ProgressStore,
+        excel_service: ExcelService, chemin: Path,
+    ) -> None:
+        """Tourne sur le fil principal (appelé depuis `_traiter_message`) :
+        affiche l'aperçu chiffré d'un `PlanSynchronisation` calculé en mode
+        miroir, puis une confirmation forte (taper le nom de la commune —
+        même principe que `_supprimer_hors_code_postal`, vu le caractère
+        potentiellement destructeur) avant de lancer l'application réelle
+        dans un nouveau thread d'arrière-plan. Réactive les boutons sans
+        rien modifier si l'utilisateur annule à n'importe quelle étape."""
+        rapport = plan.rapport
+        confirme = messagebox.askyesno(
+            APP_TITLE,
+            f"Aperçu de la synchronisation miroir pour « {plan.commune} » — RIEN n'est encore "
+            f"appliqué :\n\n"
+            f"{rapport.lignes_ajoutees} ligne(s) seront ajoutée(s)\n"
+            f"{rapport.lignes_modifiees} ligne(s) seront modifiée(s) ({rapport.cellules_corrigees} "
+            f"cellule(s) au total)\n"
+            f"{rapport.lignes_supprimees} ligne(s) seront SUPPRIMÉES DÉFINITIVEMENT\n\n"
+            f"Continuer ?",
+            icon="warning",
+        )
+        if not confirme:
+            self._reactiver_boutons()
+            self.label_statut.configure(text="Synchronisation miroir annulée — rien n'a été modifié.")
+            return
+
+        saisie = simpledialog.askstring(
+            APP_TITLE,
+            f"Pour confirmer, tape exactement le nom de la commune :\n{plan.commune}",
+            parent=self,
+        )
+        if saisie != plan.commune:
+            messagebox.showinfo(APP_TITLE, "Confirmation incorrecte ou annulée — rien n'a été modifié.")
+            self._reactiver_boutons()
+            self.label_statut.configure(text="Synchronisation miroir annulée — rien n'a été modifié.")
+            return
+
+        self.label_statut.configure(text="Application de la synchronisation miroir en cours…")
+        thread = threading.Thread(
+            target=self._executer_application_synchronisation,
+            args=(plan, progress_store, excel_service, chemin),
+            daemon=True,
+        )
+        thread.start()
+
+    def _executer_application_synchronisation(
+        self, plan: PlanSynchronisation, progress_store: ProgressStore,
+        excel_service: ExcelService, chemin: Path,
+    ) -> None:
+        """Tourne dans un thread d'arrière-plan : écrit réellement en base
+        le `PlanSynchronisation` déjà calculé et confirmé (voir
+        `sync_service.appliquer_plan_synchronisation`) — aucun appel réseau
+        ici, tout a déjà été décidé lors du calcul."""
+        try:
+            rapport = appliquer_plan_synchronisation(plan, progress_store)
+            try:
+                reecrire_excel_depuis_base(plan.commune, excel_service, progress_store, chemin)
+            except PermissionError:
+                self._message_queue.put(("sync_done_verrouille", rapport, chemin))
+                return
+            self._message_queue.put(("sync_done", rapport, chemin))
+        except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
+            logging.getLogger("gui").exception("Échec de l'application de la synchronisation miroir")
             self._message_queue.put(("error", str(exc)))
 
     # -- Recalcul côté/position (rattrapage pour les parcelles déjà résolues) -

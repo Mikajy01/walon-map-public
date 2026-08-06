@@ -34,14 +34,31 @@ Deux cas traités :
 Aucun changement de schéma SQLite ni de la logique d'écriture/lecture
 existante : compatible avec les anciens `http_cache.sqlite3` et les anciens
 fichiers Excel de sortie.
+
+Mode "synchronisation complète" (miroir) — option explicite (case à cocher,
+voir gui.py), demandée par des collaborateurs qui corrigent une cellule déjà
+remplie ou suppriment une ligne directement dans l'Excel et veulent que ces
+deux types de modification manuelle soient repris tels quels, pas seulement
+les cas 1/2 ci-dessus :
+- Toute cellule de données (G+) différente entre l'Excel et la base est
+  reprise depuis l'Excel, même si la base avait déjà une vraie valeur (pas
+  seulement ERREUR/vide comme le cas 1).
+- Toute ligne de la commune présente en base mais absente de l'Excel importé
+  est supprimée de la base (comparaison sur TOUTE la commune, pas restreinte
+  aux rues présentes dans l'Excel — décision explicite : le garde-fou est
+  l'aperçu chiffré + la confirmation par saisie du nom de la commune avant
+  application, pas une restriction automatique de périmètre).
+Calcul (`calculer_synchronisation`) et écriture (`appliquer_plan_synchronisation`)
+sont deux étapes séparées justement pour permettre cet aperçu avant
+confirmation, sans rien modifier tant que l'utilisateur n'a pas validé.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -67,31 +84,61 @@ _CLE_COLONNES = ("D", "E", "F")
 class RapportSynchronisation:
     lignes_excel: int = 0
     lignes_reconnues: int = 0
+    lignes_modifiees: int = 0
     cellules_corrigees: int = 0
     lignes_ajoutees: int = 0
     lignes_doublons: int = 0
     lignes_invalides: int = 0
+    lignes_supprimees: int = 0
     parcelles_en_base: int = 0
 
     def resume(self) -> str:
         msg = (
             f"{self.lignes_excel} ligne(s) lues dans l'Excel importé, "
-            f"{self.lignes_reconnues} déjà connue(s) en base ({self.cellules_corrigees} "
-            f"cellule(s) 'ERREUR'/vide(s) corrigée(s)), {self.lignes_ajoutees} nouvelle(s) "
+            f"{self.lignes_reconnues} déjà connue(s) en base ({self.lignes_modifiees} ligne(s), "
+            f"{self.cellules_corrigees} cellule(s) modifiée(s)), {self.lignes_ajoutees} nouvelle(s) "
             f"parcelle(s) ajoutée(s) à la base (existence vérifiée au registre ICAR), "
             f"{self.lignes_doublons} doublon(s) détecté(s) (déjà en base sous un "
             f"identifiant réel malgré un texte différent — traité(s) comme correction), "
             f"{self.lignes_invalides} ligne(s) invalide(s) (rue ou numéro introuvable au "
-            f"registre ICAR — ignorée(s), aucune donnée inventée)."
+            f"registre ICAR — ignorée(s), aucune donnée inventée)"
         )
+        if self.lignes_supprimees:
+            msg += f", {self.lignes_supprimees} ligne(s) supprimée(s) définitivement (synchronisation miroir)"
+        msg += "."
         if self.lignes_excel != self.parcelles_en_base:
             msg += (
                 f" Pour information : {self.lignes_excel} ligne(s) dans l'Excel importé, "
                 f"{self.parcelles_en_base} parcelle(s) en base au total pour cette commune "
                 f"après synchronisation (nombres différents attendus si des lignes ont été "
-                f"ajoutées, ignorées, ou si l'Excel ne couvrait qu'une partie de la commune)."
+                f"ajoutées, ignorées, supprimées, ou si l'Excel ne couvrait qu'une partie de "
+                f"la commune)."
             )
         return msg
+
+
+@dataclass
+class PlanSynchronisation:
+    """Résultat du calcul d'une synchronisation (voir
+    `calculer_synchronisation`), SANS aucune écriture en base — permet un
+    aperçu chiffré (`rapport`) avant confirmation (voir gui.py), notamment
+    nécessaire en mode miroir qui peut supprimer des lignes et écraser des
+    cellules déjà correctes. `appliquer_plan_synchronisation` rejoue
+    ensuite ce plan tel quel, sans refaire aucun appel réseau.
+
+    `a_definir` couvre à la fois les lignes corrigées ET les lignes
+    réellement nouvelles (même opération de stockage, `ProgressStore.set`).
+    `a_supprimer` (mode miroir uniquement) : (identifiant, rue, capakey ou
+    None si adressée) — le capakey sert à aussi purger
+    `parcelles_sans_adresse`, sans quoi une parcelle "sans adresse"
+    supprimée réapparaîtrait silencieusement au prochain traitement normal
+    (elle resterait dans ce cache dédié, jamais revérifié pour une rue déjà
+    connue — voir `CadastreService._parcelles_cadastrales_sans_adresse`)."""
+
+    commune: str
+    a_definir: List[Tuple[str, Dict[str, str]]] = field(default_factory=list)
+    a_supprimer: List[Tuple[str, str, Optional[str]]] = field(default_factory=list)
+    rapport: RapportSynchronisation = field(default_factory=RapportSynchronisation)
 
 
 def _corriger_cellules_erreur(
@@ -128,19 +175,65 @@ def _corriger_cellules_erreur(
     return changed
 
 
-def synchroniser_depuis_excel(
+def _appliquer_differences_completes(
+    valeurs_base: Dict[str, str], ligne: Dict[str, str], identifiant: str, rapport: RapportSynchronisation,
+) -> bool:
+    """Comme `_corriger_cellules_erreur`, mais reprend TOUTE colonne de
+    données (G et suivantes) dont la valeur diffère entre l'Excel et la
+    base, même si la base avait déjà une vraie valeur — utilisé uniquement
+    en mode "synchronisation complète" (miroir), une option explicite (case
+    à cocher, voir gui.py) : contrairement au mode par défaut, une
+    correction manuelle dans l'Excel peut ici écraser une cellule qui
+    n'était pas en erreur, c'est précisément le but demandé. N'inclut
+    JAMAIS les colonnes d'identification A-F : celles-ci restent toujours
+    calculées depuis les registres officiels (ICAR/CADMAP), jamais depuis
+    le texte Excel, même en mode miroir — voir docstring du module."""
+    changed = False
+    for col in config.COLUMN_RULES:
+        nouvelle_valeur = ligne.get(col, "")
+        if nouvelle_valeur == valeurs_base.get(col, ""):
+            continue
+        _logger.info(
+            "Parcelle %s | colonne %s : synchronisation miroir (%r -> %r).",
+            identifiant, col, valeurs_base.get(col), nouvelle_valeur,
+        )
+        valeurs_base[col] = nouvelle_valeur
+        changed = True
+        rapport.cellules_corrigees += 1
+    return changed
+
+
+def calculer_synchronisation(
     commune: str,
     pays: str,
     ws: Worksheet,
     excel_service: ExcelService,
     progress_store: ProgressStore,
     cadastre_service: CadastreService,
-) -> RapportSynchronisation:
-    """Synchronise `progress_store` à partir d'un Excel importé (voir
-    docstring du module pour les deux cas traités)."""
+    mode_miroir: bool = False,
+) -> PlanSynchronisation:
+    """Calcule ce qu'une synchronisation ferait, SANS rien écrire en base
+    (voir `appliquer_plan_synchronisation` pour l'écriture réelle) — permet
+    un aperçu chiffré avant confirmation (voir gui.py), notamment
+    nécessaire en mode miroir qui peut supprimer des lignes et écraser des
+    cellules déjà correctes. Fait les mêmes appels réseau (ICAR/CADMAP)
+    qu'une synchronisation réelle pour vérifier les lignes potentiellement
+    nouvelles — inévitable pour un aperçu chiffré exact, voir docstring du
+    module.
+
+    `mode_miroir=False` (par défaut) : comportement historique — seules les
+    cellules ERREUR/vides sont reprises (`_corriger_cellules_erreur`),
+    aucune ligne n'est jamais supprimée.
+
+    `mode_miroir=True` : reprend TOUTE cellule différente
+    (`_appliquer_differences_completes`), et supprime toute ligne de la
+    commune absente de l'Excel importé (comparaison sur TOUTE la commune,
+    pas seulement les rues présentes dans l'Excel — voir docstring du
+    module)."""
     from main import _set_identification_columns  # import tardif : évite un cycle main <-> sync_service
 
-    rapport = RapportSynchronisation()
+    plan = PlanSynchronisation(commune=commune)
+    rapport = plan.rapport
     column_order = ["A", "B", "C", "D", "E", "F"] + list(config.COLUMN_RULES.keys())
 
     lignes_excel = excel_service.lire_donnees_existantes(ws, column_order)
@@ -156,21 +249,26 @@ def synchroniser_depuis_excel(
     parcelles_icar_par_rue: Dict[str, List[Parcelle]] = {}
     identifiants_traites: set = set()
 
+    def _corriger(valeurs_base: Dict[str, str], ligne: Dict[str, str], identifiant: str) -> bool:
+        if mode_miroir:
+            return _appliquer_differences_completes(valeurs_base, ligne, identifiant, rapport)
+        return _corriger_cellules_erreur(valeurs_base, ligne, column_order, identifiant, rapport)
+
     for ligne in lignes_excel:
         cle = tuple(ligne.get(c, "") for c in _CLE_COLONNES)
         identifiant = index_textuel.get(cle)
 
         if identifiant is not None:
-            # Ligne déjà connue (correspondance textuelle directe) : seules
-            # les cellules ERREUR sont éventuellement corrigées.
+            # Ligne déjà connue (correspondance textuelle directe).
             rapport.lignes_reconnues += 1
             if identifiant in identifiants_traites:
                 rapport.lignes_doublons += 1
                 continue
             identifiants_traites.add(identifiant)
-            valeurs_base = base[identifiant]
-            if _corriger_cellules_erreur(valeurs_base, ligne, column_order, identifiant, rapport):
-                progress_store.set(commune, identifiant, valeurs_base)
+            valeurs_base = dict(base[identifiant])
+            if _corriger(valeurs_base, ligne, identifiant):
+                plan.a_definir.append((identifiant, valeurs_base))
+                rapport.lignes_modifiees += 1
             continue
 
         # Ligne non reconnue par (Rue, Numéro, Cadastral) : peut-être une
@@ -222,9 +320,10 @@ def synchroniser_depuis_excel(
             # numéro cadastral orthographié différemment. Traité comme une
             # correction sur l'existant, jamais comme une ligne en double.
             rapport.lignes_doublons += 1
-            valeurs_base = base[identifiant_reel]
-            if _corriger_cellules_erreur(valeurs_base, ligne, column_order, identifiant_reel, rapport):
-                progress_store.set(commune, identifiant_reel, valeurs_base)
+            valeurs_base = dict(base[identifiant_reel])
+            if _corriger(valeurs_base, ligne, identifiant_reel):
+                plan.a_definir.append((identifiant_reel, valeurs_base))
+                rapport.lignes_modifiees += 1
             continue
 
         # Parcelle réellement nouvelle, existence confirmée : colonnes
@@ -234,18 +333,72 @@ def synchroniser_depuis_excel(
         _set_identification_columns(parcelle_icar)
         for col in config.COLUMN_RULES:
             parcelle_icar.valeurs[col] = ligne.get(col, "")
-        progress_store.set(commune, identifiant_reel, parcelle_icar.valeurs)
+        plan.a_definir.append((identifiant_reel, parcelle_icar.valeurs))
+        # Reflète la nouvelle ligne dans `base` (mémoire seulement, rien
+        # d'écrit) pour qu'une ligne suivante du MÊME Excel résolvant au même
+        # identifiant réel soit reconnue comme doublon, pas comme une
+        # deuxième nouvelle ligne — même logique que le comportement
+        # historique, qui écrivait déjà en base à ce stade.
         base[identifiant_reel] = parcelle_icar.valeurs
         rapport.lignes_ajoutees += 1
         _logger.info(
-            "Parcelle %s (rue=%r, numéro=%r) : nouvelle ligne ajoutée à la base depuis "
+            "Parcelle %s (rue=%r, numéro=%r) : nouvelle ligne à ajouter à la base depuis "
             "l'Excel importé (existence vérifiée au registre ICAR).",
             identifiant_reel, rue_officielle, numero_excel,
         )
 
-    rapport.parcelles_en_base = len(progress_store.all_for_commune(commune))
-    _logger.info(rapport.resume())
-    return rapport
+    if mode_miroir:
+        for identifiant, valeurs in base.items():
+            if identifiant in identifiants_traites:
+                continue
+            rue = valeurs.get("D", "")
+            capakey = identifiant.rsplit("CAPAKEY:", 1)[-1] if "|CAPAKEY:" in identifiant else None
+            plan.a_supprimer.append((identifiant, rue, capakey))
+        rapport.lignes_supprimees = len(plan.a_supprimer)
+
+    rapport.parcelles_en_base = len(base) - len(plan.a_supprimer)
+    return plan
+
+
+def appliquer_plan_synchronisation(
+    plan: PlanSynchronisation, progress_store: ProgressStore,
+) -> RapportSynchronisation:
+    """Écrit réellement en base ce qu'un `PlanSynchronisation` (voir
+    `calculer_synchronisation`) a calculé — aucun appel réseau ici, tout a
+    déjà été décidé lors du calcul. Séparée du calcul pour permettre un
+    aperçu (voir gui.py) avant confirmation, notamment en mode miroir."""
+    for identifiant, valeurs in plan.a_definir:
+        progress_store.set(plan.commune, identifiant, valeurs)
+    for identifiant, rue, capakey in plan.a_supprimer:
+        progress_store.supprimer_resultat(plan.commune, identifiant)
+        if capakey:
+            progress_store.supprimer_parcelle_sans_adresse(plan.commune, rue, capakey)
+        _logger.info(
+            "Commune '%s' : parcelle %s (rue '%s') supprimée — synchronisation miroir, absente "
+            "de l'Excel importé.", plan.commune, identifiant, rue,
+        )
+    plan.rapport.parcelles_en_base = len(progress_store.all_for_commune(plan.commune))
+    _logger.info(plan.rapport.resume())
+    return plan.rapport
+
+
+def synchroniser_depuis_excel(
+    commune: str,
+    pays: str,
+    ws: Worksheet,
+    excel_service: ExcelService,
+    progress_store: ProgressStore,
+    cadastre_service: CadastreService,
+) -> RapportSynchronisation:
+    """Synchronise `progress_store` à partir d'un Excel importé (voir
+    docstring du module) — enchaîne calcul (`calculer_synchronisation`) et
+    application (`appliquer_plan_synchronisation`) immédiatement, sans
+    aperçu intermédiaire : comportement historique, utilisé par le mode par
+    défaut (case "synchronisation complète" décochée). Pour un aperçu avant
+    confirmation (mode miroir), appeler ces deux fonctions séparément — voir
+    gui.py."""
+    plan = calculer_synchronisation(commune, pays, ws, excel_service, progress_store, cadastre_service)
+    return appliquer_plan_synchronisation(plan, progress_store)
 
 
 def reecrire_excel_depuis_base(
