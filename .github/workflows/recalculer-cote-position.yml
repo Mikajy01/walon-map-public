@@ -36,6 +36,11 @@ on:
         required: false
         default: false
         type: boolean
+      forcer_redecouverte:
+        description: "Refait la redécouverte au rayon élargi pour TOUTES les rues déjà vérifiées, même celles déjà marquées (nettement plus long — utile après une mise à jour de l'application qui change la recherche, voir main.py --forcer-redecouverte)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -97,6 +102,9 @@ jobs:
           fi
           if [ "${{ inputs.debug }}" = "true" ]; then
             ARGS+=(--debug)
+          fi
+          if [ "${{ inputs.forcer_redecouverte }}" = "true" ]; then
+            ARGS+=(--forcer-redecouverte)
           fi
           python main.py "${ARGS[@]}"
 

@@ -2,9 +2,14 @@ name: Traiter une commune
 
 # Déclenché manuellement depuis l'onglet "Actions" de GitHub (bouton "Run
 # workflow") — aucune planification automatique. Tourne sur les serveurs
-# gratuits de GitHub (Ubuntu), pas sur un PC local. Les résultats (base de
-# progression + fichier Excel + logs) sont commités et poussés directement
-# dans le dépôt à la fin, pour être récupérés avec un simple `git pull`.
+# gratuits de GitHub (Ubuntu), pas sur un PC local.
+#
+# Architecture à deux dépôts, comme "Recalculer côté/position" et
+# "Retraiter les parcelles échouées" : ce dépôt (public, minutes Actions
+# illimitées) exécute le code, le dépôt privé Mikajy01/walon-map-data
+# (jeton en secret DATA_REPO_TOKEN) contient la vraie progression et reçoit
+# les résultats — jamais la base de progression ni le fichier Excel réel
+# d'une commune dans ce dépôt public.
 on:
   workflow_dispatch:
     inputs:
@@ -37,27 +42,17 @@ on:
         required: false
         default: false
         type: boolean
-      recalculer_cote_position:
-        description: "Rattrapage géométrique au lieu du traitement normal (voir main.py::recalculer_cote_position) — limit est ignoré dans ce mode, code_postal est respecté"
-        required: false
-        default: false
-        type: boolean
-      forcer_redecouverte:
-        description: "Avec recalculer_cote_position : refait la redécouverte au rayon élargi pour TOUTES les rues déjà vérifiées, même celles déjà marquées (nettement plus long — voir main.py --forcer-redecouverte)"
-        required: false
-        default: false
-        type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  # Un groupe PAR COMMUNE (pas un seul groupe global) : deux communes
-  # différentes tournent en parallèle sans jamais s'attendre, chacune écrit
-  # dans son propre fichier de cache/logs (cache/<commune>/, logs/<commune>/,
-  # voir plus bas) donc aucun conflit possible entre elles. Seules deux
-  # exécutions sur LA MÊME commune s'attendent l'une l'autre (celles-là
-  # partageraient vraiment le même fichier).
+  # Même groupe que les autres workflows pour LA MÊME commune : tous
+  # lisent/écrivent le même fichier de cache
+  # (donnees/cache/<commune>/http_cache.sqlite3), qu'il ne faut jamais
+  # laisser toucher par deux exécutions en parallèle. Deux communes
+  # différentes tournent en parallèle sans jamais s'attendre (groupe par
+  # commune, pas un seul groupe global).
   group: traiter-commune-${{ inputs.commune }}
   cancel-in-progress: false
 
@@ -71,8 +66,14 @@ jobs:
     timeout-minutes: 340
 
     steps:
-      - name: Récupérer le dépôt
+      - name: Récupérer le code
         uses: actions/checkout@v4
+
+      - name: Récupérer les données existantes (dépôt privé séparé)
+        run: |
+          set -e
+          git clone --depth 1 "https://x-access-token:${{ secrets.DATA_REPO_TOKEN }}@github.com/Mikajy01/walon-map-data.git" donnees
+          mkdir -p "donnees/cache/${{ inputs.commune }}" "donnees/output" "donnees/logs/${{ inputs.commune }}"
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -85,17 +86,12 @@ jobs:
       - name: Lancer le traitement
         run: |
           set -e
-          # cache/<commune>/ et logs/<commune>/ (au lieu des dossiers partagés
-          # par défaut) : deux communes différentes n'écrivent alors jamais
-          # dans le même fichier, ce qui permet de vraiment tourner en
-          # parallèle (voir le groupe de concurrence ci-dessus) sans risque
-          # de conflit Git sur un fichier SQLite binaire (impossible à
-          # fusionner) ni sur le fichier de log.
           ARGS=(--commune "${{ inputs.commune }}" --pays "${{ inputs.pays }}"
                 --rate-limit "${{ inputs.rate_limit }}"
                 --template "Entête walonmap (avec colonnes en plus).xlsx"
-                --cache-dir "cache/${{ inputs.commune }}"
-                --logs-dir "logs/${{ inputs.commune }}")
+                --cache-dir "donnees/cache/${{ inputs.commune }}"
+                --logs-dir "donnees/logs/${{ inputs.commune }}"
+                --output-dir "donnees/output")
           if [ -n "${{ inputs.limit }}" ]; then
             ARGS+=(--limit "${{ inputs.limit }}")
           fi
@@ -110,12 +106,6 @@ jobs:
           fi
           if [ "${{ inputs.debug }}" = "true" ]; then
             ARGS+=(--debug)
-          fi
-          if [ "${{ inputs.recalculer_cote_position }}" = "true" ]; then
-            ARGS+=(--recalculer-cote-position)
-            if [ "${{ inputs.forcer_redecouverte }}" = "true" ]; then
-              ARGS+=(--forcer-redecouverte)
-            fi
           fi
           python main.py "${ARGS[@]}"
 
@@ -137,7 +127,7 @@ jobs:
           python -c "
           import sqlite3
           from pathlib import Path
-          db_path = Path('cache/${{ inputs.commune }}/http_cache.sqlite3')
+          db_path = Path('donnees/cache/${{ inputs.commune }}/http_cache.sqlite3')
           if not db_path.exists():
               print('Pas de fichier de cache (le traitement a probablement échoué avant toute écriture) : rien à nettoyer.')
           else:
@@ -153,12 +143,12 @@ jobs:
               conn.close()
           "
 
-      - name: Committer et pousser les résultats
+      - name: Committer et pousser les résultats (dépôt de données)
         if: always()
         # `if: always()` : même si le traitement s'est arrêté avant la fin
         # (timeout, erreur), tout ce qui a été résolu jusque-là est déjà
-        # persisté dans cache/<commune>/http_cache.sqlite3 — on le committe
-        # quand même pour ne jamais perdre de travail déjà fait.
+        # persisté dans donnees/cache/<commune>/http_cache.sqlite3 — on le
+        # committe quand même pour ne jamais perdre de travail déjà fait.
         #
         # Réessai avec rebase avant de pousser : même avec des fichiers
         # séparés par commune, deux exécutions peuvent finir à quelques
@@ -167,6 +157,7 @@ jobs:
         # commune, déjà poussée) — un simple nouvel essai après rebase
         # suffit puisque les fichiers touchés ne se recoupent pas.
         run: |
+          cd donnees
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f "cache/${{ inputs.commune }}/http_cache.sqlite3" \
@@ -177,12 +168,7 @@ jobs:
             echo "Rien de nouveau à committer."
             exit 0
           fi
-          if [ "${{ inputs.recalculer_cote_position }}" = "true" ]; then
-            LIBELLE="Rattrapage géométrique"
-          else
-            LIBELLE="Traitement automatique"
-          fi
-          git commit -m "$LIBELLE : ${{ inputs.commune }} (${{ github.run_id }})"
+          git commit -m "Traitement automatique : ${{ inputs.commune }} (${{ github.run_id }})"
           for tentative in 1 2 3 4 5; do
             if git push; then
               exit 0
