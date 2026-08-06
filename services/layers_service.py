@@ -95,8 +95,9 @@ class LayersService:
 
     def retry_erreurs(self, parcelle: Parcelle) -> int:
         """Retente la résolution de chaque colonne actuellement à
-        `"ERREUR"` pour une parcelle DÉJÀ résolue lors d'une exécution
-        précédente (voir main.py, reprise incrémentale).
+        `"ERREUR"` OU vide (absente de `parcelle.valeurs`) pour une
+        parcelle DÉJÀ résolue lors d'une exécution précédente (voir
+        main.py, reprise incrémentale).
 
         Contrairement aux autres colonnes d'une parcelle déjà traitée
         (figées à raison : données géographiques stables, aucune raison de
@@ -114,6 +115,17 @@ class LayersService:
         dans les logs à chaque tentative (aucun masquage d'un vrai bug de
         code), simplement sans jamais bloquer définitivement.
 
+        Le cas vide couvre une cellule jamais écrite du tout lors d'une
+        exécution antérieure — cas réel constaté sur Comines-Warneton :
+        des centaines de lignes déjà traitées avaient une colonne (K pour
+        un lot, Y pour un autre, jamais les deux à la fois) totalement
+        absente de `valeurs`, pas à `"ERREUR"` — un bug de résolution deux
+        fois plus ancien que ce garde-fou, pour une seule colonne à la
+        fois, jamais rejoué depuis puisque `"ERREUR"` seul était retenté.
+        Aucune règle du moteur ne produit jamais légitimement une chaîne
+        vide (toujours O/N/ERREUR/une valeur fixe comme "/"), donc sans
+        risque de considérer une cellule vide comme un échec à retenter.
+
         Nécessite que `parcelle.geometry` soit déjà renseignée (voir
         `CadastreService.rattacher_parcelle_cadastrale`, à appeler par
         l'appelant avant celle-ci pour les parcelles concernées).
@@ -126,20 +138,22 @@ class LayersService:
         )
         cellules_corrigees = 0
         for rule in ordered_rules:
-            if parcelle.valeurs.get(rule.column) != "ERREUR":
+            valeur_actuelle = parcelle.valeurs.get(rule.column)
+            if valeur_actuelle != "ERREUR" and valeur_actuelle:
                 continue
             try:
                 nouvelle_valeur = self._resolve_one(rule, parcelle)
             except Exception:  # noqa: BLE001 - un échec répété ne doit jamais arrêter le traitement
                 _logger.exception(
                     "Nouvelle tentative échouée pour la colonne %s (%s) de la parcelle "
-                    "%s — valeur 'ERREUR' conservée.", rule.column, rule.header, parcelle.identifiant,
+                    "%s — valeur %r conservée.", rule.column, rule.header, parcelle.identifiant, valeur_actuelle,
                 )
                 continue
             if nouvelle_valeur != "ERREUR":
                 _logger.info(
-                    "Parcelle %s | colonne %s (%s) : erreur résolue au nouvel essai -> %r.",
-                    parcelle.identifiant, rule.column, rule.header, nouvelle_valeur,
+                    "Parcelle %s | colonne %s (%s) : %s résolue au nouvel essai -> %r.",
+                    parcelle.identifiant, rule.column, rule.header,
+                    "cellule vide" if not valeur_actuelle else "erreur", nouvelle_valeur,
                 )
                 parcelle.valeurs[rule.column] = nouvelle_valeur
                 cellules_corrigees += 1

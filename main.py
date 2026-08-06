@@ -331,11 +331,18 @@ def traiter_commune(
                 # un échec de résolution (souvent un incident transitoire
                 # côté serveur, voir LayersService.retry_erreurs) : on la
                 # retente à chaque exécution plutôt que de la figer pour
-                # toujours. Coût limité au rattachement cadastral (1
-                # requête) + aux seules colonnes en erreur, pas toute la
-                # parcelle — négligeable tant que le nombre de parcelles en
-                # erreur reste faible devant le total de la commune.
-                if any(v == "ERREUR" for v in cached.values()):
+                # toujours. Une colonne totalement absente de `cached`
+                # (jamais écrite du tout par une exécution antérieure —
+                # cas réel constaté sur Comines-Warneton, colonnes K/Y)
+                # est traitée pareil : `retry_erreurs` la retente aussi
+                # (voir sa docstring). Coût limité au rattachement
+                # cadastral (1 requête) + aux seules colonnes concernées,
+                # pas toute la parcelle — négligeable tant que le nombre de
+                # parcelles concernées reste faible devant le total de la
+                # commune.
+                if any(v == "ERREUR" for v in cached.values()) or any(
+                    not cached.get(col) for col in config.COLUMN_RULES
+                ):
                     parcelles_retentees += 1
                     try:
                         cadastre_service.rattacher_parcelle_cadastrale(parcelle)
