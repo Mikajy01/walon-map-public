@@ -94,6 +94,53 @@ class RapportEchecs:
         return self.restantes == 0
 
 
+@dataclass
+class RapportRecalcul:
+    """Résultat d'un appel à `recalculer_cote_position` — un compteur par
+    étape plutôt qu'un seul total, pour que l'appelant (CLI, GUI, GitHub
+    Actions) puisse afficher un vrai récapitulatif (combien redécouvertes,
+    combien recollées, combien supprimées et pour laquelle des 3 raisons)
+    au lieu d'un chiffre agrégé opaque — demandé après qu'un utilisateur
+    ait cherché à savoir combien de lignes avaient été supprimées sans
+    pouvoir le déduire du seul total."""
+
+    parcelles_redecouvertes: int = 0  # étape 1 : nouvelles parcelles trouvées au rayon élargi
+    troncons_recolles: int = 0  # étape 2 : côté/position recalculé après recollement des tronçons
+    cote_position_corriges: int = 0  # étape 3 : côté/position manquants complétés
+    supprimees_adresse_ailleurs: int = 0  # étape 4
+    supprimees_doublon_rue: int = 0  # étape 5
+    supprimees_commune_voisine: int = 0  # étape 6
+
+    @property
+    def total_supprimees(self) -> int:
+        return self.supprimees_adresse_ailleurs + self.supprimees_doublon_rue + self.supprimees_commune_voisine
+
+    @property
+    def total(self) -> int:
+        return (
+            self.parcelles_redecouvertes + self.troncons_recolles + self.cote_position_corriges
+            + self.total_supprimees
+        )
+
+    def resume(self, commune: str) -> str:
+        if not self.total:
+            return (
+                f"Commune '{commune}' : rien à corriger (aucune nouvelle parcelle au rayon "
+                f"élargi, aucune parcelle sans côté/position, aucun doublon détecté, aucune "
+                f"parcelle d'une commune voisine détectée)."
+            )
+        return (
+            f"Commune '{commune}' : {self.total} correction(s) au total — "
+            f"{self.parcelles_redecouvertes} nouvelle(s) parcelle(s) trouvée(s) (rayon élargi), "
+            f"{self.troncons_recolles} côté/position recalculé(s) (tronçons recollés), "
+            f"{self.cote_position_corriges} côté/position complété(s) (manquants), "
+            f"{self.total_supprimees} parcelle(s) supprimée(s) au total "
+            f"({self.supprimees_adresse_ailleurs} adresse ailleurs, "
+            f"{self.supprimees_doublon_rue} doublon rue la plus proche, "
+            f"{self.supprimees_commune_voisine} commune voisine)."
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Remplit le fichier Excel Walonmap à partir du Géoportail de Wallonie."
@@ -165,7 +212,8 @@ def parse_args() -> argparse.Namespace:
              "dans la commune, et pour celles candidates sur plusieurs rues à "
              "la fois ne garde que la plus proche géométriquement (voir "
              "main.py::recalculer_cote_position). À lancer une fois par "
-             "commune (ex: workflow GitHub Actions dédié) — les parcelles "
+             "commune (ex: workflow GitHub Actions \"Traiter une commune\", "
+             "option recalculer_cote_position) — les parcelles "
              "traitées normalement n'ont déjà plus ces problèmes. --limit est "
              "ignoré dans ce mode ; --code-postal, lui, est respecté (utile "
              "pour une commune fusionnée dont on ne gère qu'un sous-ensemble "
@@ -552,7 +600,7 @@ def recalculer_cote_position(
     codes_postaux: Optional[List[str]] = None,
     on_progress: Optional[ProgressCallback] = None,
     forcer_redecouverte: bool = False,
-) -> int:
+) -> RapportRecalcul:
     """Rattrapage géométrique unique, à lancer une fois par commune, qui
     corrige en une passe tout ce qui a changé après coup dans le calcul
     géométrique des parcelles déjà connues (un seul bouton/flag plutôt
@@ -567,8 +615,8 @@ def recalculer_cote_position(
        de référence de Crisnée, parcelles jusqu'à 176m du tracé). Nettement
        plus coûteux que les étapes suivantes (fenêtre de recherche ~64x
        plus grande) — pour une commune déjà largement traitée, à lancer
-       de préférence via le workflow GitHub Actions dédié plutôt qu'en
-       local.
+       de préférence via le workflow GitHub Actions "Traiter une commune"
+       (option recalculer_cote_position) plutôt qu'en local.
     2. Recolle les tronçons PICC d'une rue dans le bon ordre/sens (voir
        `utils/geometrie.py::_rechainer_chemins`) et recalcule côté/position
        pour TOUTES les parcelles déjà résolues des rues à plusieurs
@@ -607,8 +655,9 @@ def recalculer_cote_position(
 
     Les parcelles traitées normalement (`traiter_commune`) depuis l'ajout
     de ces vérifications n'ont déjà plus ces problèmes ; relancer ceci ne
-    fait rien. Renvoie le nombre total de corrections effectuées (0 si la
-    commune n'a rien à rattraper).
+    fait rien. Renvoie un `RapportRecalcul` (un compteur par étape, voir sa
+    docstring) plutôt qu'un simple total, pour permettre un vrai
+    récapitulatif détaillé côté appelant.
 
     `codes_postaux`, si fourni, restreint les cinq étapes aux rues/
     parcelles de ces codes postaux — indispensable pour une commune
@@ -638,7 +687,7 @@ def recalculer_cote_position(
     recalcul normal (refait l'étape 1 pour des rues qui n'en avaient pas
     besoin) : à réserver à un doute concret plutôt qu'à un usage
     systématique."""
-    total_corrections = 0
+    rapport = RapportRecalcul()
     segments_par_rue: Dict[str, list] = {}
 
     def _point_reference(rue: str) -> Optional[Tuple[float, float]]:
@@ -694,7 +743,7 @@ def recalculer_cote_position(
                 "Commune '%s' : rue '%s' redécouverte avec le rayon élargi — %d nouvelle(s) "
                 "parcelle(s) sans adresse trouvée(s).", commune, rue, len(nouvelles_capakeys),
             )
-            total_corrections += len(nouvelles_capakeys)
+            rapport.parcelles_redecouvertes += len(nouvelles_capakeys)
 
     base = progress_store.all_for_commune(commune)
 
@@ -762,7 +811,7 @@ def recalculer_cote_position(
                 "Commune '%s' : rue '%s' recollée (%d tronçon(s)) — %d parcelle(s) "
                 "côté/position recalculée(s).", commune, rue, nb_chemins, corrigees_cette_rue,
             )
-            total_corrections += corrigees_cette_rue
+            rapport.troncons_recolles += corrigees_cette_rue
 
     # -- 3. Côté/position manquants (parcelles déjà résolues) --------------
     a_corriger_cote_position: Dict[str, list] = {}
@@ -803,7 +852,7 @@ def recalculer_cote_position(
             if "|CAPAKEY:" in identifiant:
                 capakey = identifiant.rsplit("CAPAKEY:", 1)[-1]
                 progress_store.maj_cote_position_sans_adresse(commune, rue, capakey, cote, position)
-            total_corrections += 1
+            rapport.cote_position_corriges += 1
 
     # -- 4. Parcelles "sans adresse" ayant en réalité une adresse ailleurs -
     rues_verifiees = progress_store.rues_verifiees_commune(commune)
@@ -823,7 +872,7 @@ def recalculer_cote_position(
                 "Commune '%s' : parcelle %s (rue '%s') retirée — a en réalité une adresse "
                 "sur une autre rue.", commune, capakey, rue,
             )
-            total_corrections += 1
+            rapport.supprimees_adresse_ailleurs += 1
 
     # -- 5. Parcelles "sans adresse" candidates sur plusieurs rues à la fois
     # (relire rues_verifiees + parcelles_sans_adresse APRÈS l'étape 3 :
@@ -871,7 +920,7 @@ def recalculer_cote_position(
                 "Commune '%s' : parcelle %s candidate sur %d rue(s) — rue la plus proche "
                 "retenue : '%s'.", commune, capakey, len(rues_candidates), meilleure_rue,
             )
-            total_corrections += 1
+            rapport.supprimees_doublon_rue += 1
 
     # -- 6. Parcelles "sans adresse" appartenant en réalité à une commune
     # voisine (recherche par rayon avant le filtre NOM_COMMUNE ajouté à
@@ -902,25 +951,14 @@ def recalculer_cote_position(
                 "Commune '%s' : parcelle %s (rue '%s') retirée — appartient en réalité à la "
                 "commune '%s'.", commune, capakey, rue, commune_reelle,
             )
-            total_corrections += 1
+            rapport.supprimees_commune_voisine += 1
         if not filtre_a_ignore_une_entree:
             progress_store.marquer_rue_commune_verifiee(commune, rue)
 
-    if total_corrections:
+    if rapport.total:
         _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
-        _logger.info(
-            "Commune '%s' : %d correction(s) géométrique(s) appliquée(s) (nouvelles parcelles "
-            "au rayon élargi, tronçons recollés, côté/position, doublons adresse ailleurs, "
-            "doublons rue la plus proche, parcelles d'une commune voisine confondus).",
-            commune, total_corrections,
-        )
-    else:
-        _logger.info(
-            "Commune '%s' : rien à corriger (aucune nouvelle parcelle au rayon élargi, aucune "
-            "parcelle sans côté/position, aucun doublon détecté, aucune parcelle d'une commune "
-            "voisine détectée).", commune,
-        )
-    return total_corrections
+    _logger.info(rapport.resume(commune))
+    return rapport
 
 
 def retraiter_echecs(

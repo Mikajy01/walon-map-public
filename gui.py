@@ -37,6 +37,7 @@ import customtkinter as ctk
 import config
 from main import (
     RapportEchecs,
+    RapportRecalcul,
     ResultatTraitement,
     recalculer_cote_position,
     retraiter_echecs,
@@ -310,7 +311,7 @@ class App(ctk.CTk):
         elif kind == "sync_preview":
             self._gerer_apercu_synchronisation_miroir(*message[1:])
         elif kind == "recalcul_done":
-            self._fin_recalcul(n=message[1], chemin=message[2])
+            self._fin_recalcul(rapport=message[1], chemin=message[2])
         elif kind == "retraitement_echecs_done":
             self._fin_retraitement_echecs(rapport=message[1], chemin=message[2])
         elif kind == "error":
@@ -872,12 +873,12 @@ class App(ctk.CTk):
             def on_progress(phase: str, actuel: int, total: int) -> None:
                 self._message_queue.put(("progress", phase, actuel, total))
 
-            n = recalculer_cote_position(
+            rapport = recalculer_cote_position(
                 commune, cadastre_service, progress_store, excel_service,
                 output_path=fichier_sortie, codes_postaux=codes_postaux, on_progress=on_progress,
                 forcer_redecouverte=forcer_redecouverte,
             )
-            self._message_queue.put(("recalcul_done", n, fichier_sortie))
+            self._message_queue.put(("recalcul_done", rapport, fichier_sortie))
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
             logging.getLogger("gui").exception("Échec du recalcul côté/position")
             self._message_queue.put(("error", str(exc)))
@@ -1132,13 +1133,23 @@ class App(ctk.CTk):
             self.label_statut.configure(text=texte)
             messagebox.showinfo(APP_TITLE, texte)
 
-    def _fin_recalcul(self, n: int, chemin: Path) -> None:
+    def _fin_recalcul(self, rapport: RapportRecalcul, chemin: Path) -> None:
         self._reactiver_boutons()
         self.barre_progression.set(1)
-        if n:
+        if rapport.total:
             self._output_path = chemin
             self.bouton_ouvrir_dossier.configure(state="normal")
-            texte = f"Recalcul terminé — {n} correction(s) appliquée(s) (côté/position et doublons). Fichier généré : {chemin}"
+            texte = (
+                f"Recalcul terminé — {rapport.total} correction(s) au total : "
+                f"{rapport.parcelles_redecouvertes} nouvelle(s) parcelle(s) (rayon élargi), "
+                f"{rapport.troncons_recolles} côté/position recalculé(s) (tronçons recollés), "
+                f"{rapport.cote_position_corriges} côté/position complété(s), "
+                f"{rapport.total_supprimees} parcelle(s) supprimée(s) "
+                f"({rapport.supprimees_adresse_ailleurs} adresse ailleurs, "
+                f"{rapport.supprimees_doublon_rue} doublon rue la plus proche, "
+                f"{rapport.supprimees_commune_voisine} commune voisine). "
+                f"Fichier généré : {chemin}"
+            )
         else:
             texte = "Recalcul terminé — rien à corriger (côté/position déjà calculés, aucun doublon détecté)."
         self._ajouter_log(texte)

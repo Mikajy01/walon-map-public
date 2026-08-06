@@ -2,16 +2,9 @@ name: Traiter une commune
 
 # Déclenché manuellement depuis l'onglet "Actions" de GitHub (bouton "Run
 # workflow") — aucune planification automatique. Tourne sur les serveurs
-# gratuits de GitHub (Ubuntu), pas sur un PC local, et gratuitement/sans
-# limite puisque CE dépôt (le code) est public — les minutes Actions sont
-# illimitées sur les dépôts publics.
-#
-# Le code et les données sont volontairement séparés dans deux dépôts :
-# ce dépôt-ci (public, juste la logique du programme, rien de sensible)
-# et Mikajy01/walon-map-data (privé, contient la vraie progression et les
-# fichiers Excel vendus aux clients — jamais exposé publiquement). Le
-# jeton d'accès à ce second dépôt est stocké en secret GitHub Actions
-# (DATA_REPO_TOKEN), jamais visible dans le code ni dans les logs.
+# gratuits de GitHub (Ubuntu), pas sur un PC local. Les résultats (base de
+# progression + fichier Excel + logs) sont commités et poussés directement
+# dans le dépôt à la fin, pour être récupérés avec un simple `git pull`.
 on:
   workflow_dispatch:
     inputs:
@@ -44,36 +37,42 @@ on:
         required: false
         default: false
         type: boolean
+      recalculer_cote_position:
+        description: "Rattrapage géométrique au lieu du traitement normal (voir main.py::recalculer_cote_position) — limit est ignoré dans ce mode, code_postal est respecté"
+        required: false
+        default: false
+        type: boolean
+      forcer_redecouverte:
+        description: "Avec recalculer_cote_position : refait la redécouverte au rayon élargi pour TOUTES les rues déjà vérifiées, même celles déjà marquées (nettement plus long — voir main.py --forcer-redecouverte)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  # Un groupe PAR COMMUNE : deux communes différentes tournent en
-  # parallèle sans jamais s'attendre (chacune dans son propre fichier de
-  # cache/logs côté dépôt de données). Seules deux exécutions sur LA MÊME
-  # commune s'attendent l'une l'autre.
+  # Un groupe PAR COMMUNE (pas un seul groupe global) : deux communes
+  # différentes tournent en parallèle sans jamais s'attendre, chacune écrit
+  # dans son propre fichier de cache/logs (cache/<commune>/, logs/<commune>/,
+  # voir plus bas) donc aucun conflit possible entre elles. Seules deux
+  # exécutions sur LA MÊME commune s'attendent l'une l'autre (celles-là
+  # partageraient vraiment le même fichier).
   group: traiter-commune-${{ inputs.commune }}
   cancel-in-progress: false
 
 jobs:
   traiter:
     runs-on: ubuntu-latest
-    # Marge sous la limite de 6h des runners hébergés GitHub. Le débit
-    # réel observé est très inférieur au débit configuré (latence réseau
-    # par requête, pas la limitation de débit elle-même) : une limite de
-    # 500 parcelles peut prendre plusieurs heures selon la commune.
+    # Marge sous la limite de 6h des runners hébergés GitHub gratuits. Le
+    # débit réel observé est très inférieur au débit configuré (latence
+    # réseau par requête, pas la limitation de débit elle-même) : une limite
+    # de 500 parcelles peut prendre plusieurs heures selon la commune.
     timeout-minutes: 340
 
     steps:
-      - name: Récupérer le code
+      - name: Récupérer le dépôt
         uses: actions/checkout@v4
-
-      - name: Récupérer les données existantes (dépôt privé séparé)
-        run: |
-          set -e
-          git clone --depth 1 "https://x-access-token:${{ secrets.DATA_REPO_TOKEN }}@github.com/Mikajy01/walon-map-data.git" donnees
-          mkdir -p donnees/cache donnees/output donnees/logs
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -86,15 +85,17 @@ jobs:
       - name: Lancer le traitement
         run: |
           set -e
-          # cache/logs isolés par commune (voir concurrency ci-dessus),
-          # sortie Excel dans le dépôt de données plutôt que dans ce
-          # checkout de code (--output-dir).
+          # cache/<commune>/ et logs/<commune>/ (au lieu des dossiers partagés
+          # par défaut) : deux communes différentes n'écrivent alors jamais
+          # dans le même fichier, ce qui permet de vraiment tourner en
+          # parallèle (voir le groupe de concurrence ci-dessus) sans risque
+          # de conflit Git sur un fichier SQLite binaire (impossible à
+          # fusionner) ni sur le fichier de log.
           ARGS=(--commune "${{ inputs.commune }}" --pays "${{ inputs.pays }}"
                 --rate-limit "${{ inputs.rate_limit }}"
                 --template "Entête walonmap (avec colonnes en plus).xlsx"
-                --cache-dir "donnees/cache/${{ inputs.commune }}"
-                --logs-dir "donnees/logs/${{ inputs.commune }}"
-                --output-dir "donnees/output")
+                --cache-dir "cache/${{ inputs.commune }}"
+                --logs-dir "logs/${{ inputs.commune }}")
           if [ -n "${{ inputs.limit }}" ]; then
             ARGS+=(--limit "${{ inputs.limit }}")
           fi
@@ -110,6 +111,12 @@ jobs:
           if [ "${{ inputs.debug }}" = "true" ]; then
             ARGS+=(--debug)
           fi
+          if [ "${{ inputs.recalculer_cote_position }}" = "true" ]; then
+            ARGS+=(--recalculer-cote-position)
+            if [ "${{ inputs.forcer_redecouverte }}" = "true" ]; then
+              ARGS+=(--forcer-redecouverte)
+            fi
+          fi
           python main.py "${ARGS[@]}"
 
       - name: Vider le cache HTTP brut avant de committer
@@ -121,16 +128,16 @@ jobs:
         # vraie progression, à conserver). Le laisser s'accumuler à chaque
         # exécution ferait regrossir le fichier indéfiniment (observé en
         # conditions réelles : 160-240 Mo pour ~1000-1800 parcelles avec le
-        # cache HTTP inclus, contre 1,4-2,4 Mo sans lui) jusqu'à dépasser la
-        # limite de 100 Mo de GitHub. On le vide donc (DELETE + VACUUM, qui
-        # réduit réellement la taille du fichier) juste avant de committer —
-        # la vitesse au sein d'une même exécution n'est pas affectée, seul
-        # ce qui est poussé dans le dépôt de données reste petit.
+        # cache HTTP inclus, contre 1,4-2,4 Mo sans lui) jusqu'à dépasser à
+        # nouveau la limite de 100 Mo de GitHub. On le vide donc (DELETE +
+        # VACUUM, qui réduit réellement la taille du fichier) juste avant de
+        # committer — la vitesse au sein d'une même exécution n'est pas
+        # affectée, seul ce qui est poussé dans le dépôt reste petit.
         run: |
           python -c "
           import sqlite3
           from pathlib import Path
-          db_path = Path('donnees/cache/${{ inputs.commune }}/http_cache.sqlite3')
+          db_path = Path('cache/${{ inputs.commune }}/http_cache.sqlite3')
           if not db_path.exists():
               print('Pas de fichier de cache (le traitement a probablement échoué avant toute écriture) : rien à nettoyer.')
           else:
@@ -146,31 +153,36 @@ jobs:
               conn.close()
           "
 
-      - name: Committer et pousser les résultats (dépôt de données)
+      - name: Committer et pousser les résultats
         if: always()
         # `if: always()` : même si le traitement s'est arrêté avant la fin
-        # (timeout, quota, erreur), tout ce qui a été résolu jusque-là est
-        # déjà persisté dans donnees/cache/<commune>/http_cache.sqlite3 —
-        # on le committe quand même pour ne jamais perdre de travail déjà
-        # fait.
+        # (timeout, erreur), tout ce qui a été résolu jusque-là est déjà
+        # persisté dans cache/<commune>/http_cache.sqlite3 — on le committe
+        # quand même pour ne jamais perdre de travail déjà fait.
         #
         # Réessai avec rebase avant de pousser : même avec des fichiers
         # séparés par commune, deux exécutions peuvent finir à quelques
         # secondes d'intervalle et vouloir pousser sur un dépôt qui a bougé
-        # entretemps — un simple nouvel essai après rebase suffit puisque
-        # les fichiers touchés ne se recoupent pas.
+        # entretemps (ex: la sortie `output/<commune>.xlsx` d'une AUTRE
+        # commune, déjà poussée) — un simple nouvel essai après rebase
+        # suffit puisque les fichiers touchés ne se recoupent pas.
         run: |
-          cd donnees
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f "cache/${{ inputs.commune }}/http_cache.sqlite3" \
                      "logs/${{ inputs.commune }}/" \
-                     "output/${{ inputs.commune }}.xlsx" 2>/dev/null || true
+                     "output/${{ inputs.commune }}.xlsx" \
+                     "output/${{ inputs.commune }}-"*.xlsx 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "Rien de nouveau à committer."
             exit 0
           fi
-          git commit -m "Traitement automatique : ${{ inputs.commune }} (${{ github.run_id }})"
+          if [ "${{ inputs.recalculer_cote_position }}" = "true" ]; then
+            LIBELLE="Rattrapage géométrique"
+          else
+            LIBELLE="Traitement automatique"
+          fi
+          git commit -m "$LIBELLE : ${{ inputs.commune }} (${{ github.run_id }})"
           for tentative in 1 2 3 4 5; do
             if git push; then
               exit 0
