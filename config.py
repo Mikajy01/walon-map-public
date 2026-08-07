@@ -26,7 +26,7 @@ from models.rules import ColumnRule, LayerRef, RuleType
 # d'aucun correctif ultérieur tant que l'app n'est pas mise à jour, sans
 # aucun signe visible de la version utilisée jusqu'ici). À incrémenter à
 # chaque nouvelle construction distribuée aux collaborateurs.
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Chemins
