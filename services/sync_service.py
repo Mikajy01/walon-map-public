@@ -35,22 +35,29 @@ Aucun changement de schéma SQLite ni de la logique d'écriture/lecture
 existante : compatible avec les anciens `http_cache.sqlite3` et les anciens
 fichiers Excel de sortie.
 
-Mode "synchronisation complète" (miroir) — option explicite (case à cocher,
-voir gui.py), demandée par des collaborateurs qui corrigent une cellule déjà
-remplie ou suppriment une ligne directement dans l'Excel et veulent que ces
-deux types de modification manuelle soient repris tels quels, pas seulement
-les cas 1/2 ci-dessus :
-- Toute cellule de données (G+) différente entre l'Excel et la base est
-  reprise depuis l'Excel, même si la base avait déjà une vraie valeur (pas
-  seulement ERREUR/vide comme le cas 1).
-- Toute ligne de la commune présente en base mais absente de l'Excel importé
-  est supprimée de la base (comparaison sur TOUTE la commune, pas restreinte
-  aux rues présentes dans l'Excel — décision explicite : le garde-fou est
-  l'aperçu chiffré + la confirmation par saisie du nom de la commune avant
-  application, pas une restriction automatique de périmètre).
+Deux options indépendantes (cases à cocher, voir gui.py), chacune sans
+rapport avec l'autre — jamais bundlées ensemble, précisément pour éviter
+qu'activer l'une déclenche l'autre par accident (voir plus bas, incident
+réel) :
+
+- `modifier_cellules` : reprend TOUTE cellule de données (G+) différente
+  entre l'Excel et la base, même si la base avait déjà une vraie valeur (pas
+  seulement ERREUR/vide comme le cas 1 ci-dessus). Ne supprime jamais rien.
+- `supprimer_lignes_absentes` : supprime de la base toute ligne de la
+  commune absente de l'Excel importé (comparaison sur TOUTE la commune).
+
 Calcul (`calculer_synchronisation`) et écriture (`appliquer_plan_synchronisation`)
-sont deux étapes séparées justement pour permettre cet aperçu avant
+sont deux étapes séparées justement pour permettre un aperçu chiffré avant
 confirmation, sans rien modifier tant que l'utilisateur n'a pas validé.
+
+Historique : une première version bundlait ces deux options sous une seule
+case "synchronisation complète (miroir)" activant les deux à la fois.
+Incident réel : un collaborateur import un Excel en cochant cette case
+unique pour reprendre des cellules corrigées à la main, sans réaliser que
+ça activait AUSSI la suppression — la commune est passée de plusieurs
+milliers de lignes à 40. Séparées en deux options désormais : cocher
+"modifier" seul ne supprime jamais rien, "supprimer" est un choix
+explicite et distinct, jamais un effet de bord d'une autre case.
 """
 
 from __future__ import annotations
@@ -104,7 +111,7 @@ class RapportSynchronisation:
             f"registre ICAR — ignorée(s), aucune donnée inventée)"
         )
         if self.lignes_supprimees:
-            msg += f", {self.lignes_supprimees} ligne(s) supprimée(s) définitivement (synchronisation miroir)"
+            msg += f", {self.lignes_supprimees} ligne(s) supprimée(s) définitivement (absentes de l'Excel)"
         msg += "."
         if self.lignes_excel != self.parcelles_en_base:
             msg += (
@@ -122,14 +129,16 @@ class PlanSynchronisation:
     """Résultat du calcul d'une synchronisation (voir
     `calculer_synchronisation`), SANS aucune écriture en base — permet un
     aperçu chiffré (`rapport`) avant confirmation (voir gui.py), notamment
-    nécessaire en mode miroir qui peut supprimer des lignes et écraser des
-    cellules déjà correctes. `appliquer_plan_synchronisation` rejoue
-    ensuite ce plan tel quel, sans refaire aucun appel réseau.
+    nécessaire dès que `modifier_cellules` ou `supprimer_lignes_absentes`
+    est activée (l'une peut écraser des cellules déjà correctes, l'autre
+    supprime des lignes). `appliquer_plan_synchronisation` rejoue ensuite ce
+    plan tel quel, sans refaire aucun appel réseau.
 
     `a_definir` couvre à la fois les lignes corrigées ET les lignes
     réellement nouvelles (même opération de stockage, `ProgressStore.set`).
-    `a_supprimer` (mode miroir uniquement) : (identifiant, rue, capakey ou
-    None si adressée) — le capakey sert à aussi purger
+    `a_supprimer` (option `supprimer_lignes_absentes` uniquement) :
+    (identifiant, rue, capakey ou None si adressée) — le capakey sert à
+    aussi purger
     `parcelles_sans_adresse`, sans quoi une parcelle "sans adresse"
     supprimée réapparaîtrait silencieusement au prochain traitement normal
     (elle resterait dans ce cache dédié, jamais revérifié pour une rue déjà
@@ -181,20 +190,21 @@ def _appliquer_differences_completes(
     """Comme `_corriger_cellules_erreur`, mais reprend TOUTE colonne de
     données (G et suivantes) dont la valeur diffère entre l'Excel et la
     base, même si la base avait déjà une vraie valeur — utilisé uniquement
-    en mode "synchronisation complète" (miroir), une option explicite (case
-    à cocher, voir gui.py) : contrairement au mode par défaut, une
-    correction manuelle dans l'Excel peut ici écraser une cellule qui
-    n'était pas en erreur, c'est précisément le but demandé. N'inclut
-    JAMAIS les colonnes d'identification A-F : celles-ci restent toujours
-    calculées depuis les registres officiels (ICAR/CADMAP), jamais depuis
-    le texte Excel, même en mode miroir — voir docstring du module."""
+    si l'option `modifier_cellules` est cochée (voir gui.py) : contrairement
+    au mode par défaut, une correction manuelle dans l'Excel peut ici
+    écraser une cellule qui n'était pas en erreur, c'est précisément le but
+    demandé. Ne supprime jamais aucune ligne (voir `supprimer_lignes_absentes`
+    pour ça, une option séparée). N'inclut JAMAIS les colonnes
+    d'identification A-F : celles-ci restent toujours calculées depuis les
+    registres officiels (ICAR/CADMAP), jamais depuis le texte Excel — voir
+    docstring du module."""
     changed = False
     for col in config.COLUMN_RULES:
         nouvelle_valeur = ligne.get(col, "")
         if nouvelle_valeur == valeurs_base.get(col, ""):
             continue
         _logger.info(
-            "Parcelle %s | colonne %s : synchronisation miroir (%r -> %r).",
+            "Parcelle %s | colonne %s : modification reprise depuis l'Excel (%r -> %r).",
             identifiant, col, valeurs_base.get(col), nouvelle_valeur,
         )
         valeurs_base[col] = nouvelle_valeur
@@ -210,26 +220,31 @@ def calculer_synchronisation(
     excel_service: ExcelService,
     progress_store: ProgressStore,
     cadastre_service: CadastreService,
-    mode_miroir: bool = False,
+    modifier_cellules: bool = False,
+    supprimer_lignes_absentes: bool = False,
 ) -> PlanSynchronisation:
     """Calcule ce qu'une synchronisation ferait, SANS rien écrire en base
     (voir `appliquer_plan_synchronisation` pour l'écriture réelle) — permet
     un aperçu chiffré avant confirmation (voir gui.py), notamment
-    nécessaire en mode miroir qui peut supprimer des lignes et écraser des
-    cellules déjà correctes. Fait les mêmes appels réseau (ICAR/CADMAP)
-    qu'une synchronisation réelle pour vérifier les lignes potentiellement
-    nouvelles — inévitable pour un aperçu chiffré exact, voir docstring du
-    module.
+    nécessaire dès que l'une des deux options ci-dessous est activée (l'une
+    peut écraser des cellules déjà correctes, l'autre supprime des lignes).
+    Fait les mêmes appels réseau (ICAR/CADMAP) qu'une synchronisation réelle
+    pour vérifier les lignes potentiellement nouvelles — inévitable pour un
+    aperçu chiffré exact, voir docstring du module.
 
-    `mode_miroir=False` (par défaut) : comportement historique — seules les
-    cellules ERREUR/vides sont reprises (`_corriger_cellules_erreur`),
-    aucune ligne n'est jamais supprimée.
+    `modifier_cellules=False` et `supprimer_lignes_absentes=False` (par
+    défaut, les deux) : comportement historique — seules les cellules
+    ERREUR/vides sont reprises (`_corriger_cellules_erreur`), aucune ligne
+    n'est jamais supprimée.
 
-    `mode_miroir=True` : reprend TOUTE cellule différente
-    (`_appliquer_differences_completes`), et supprime toute ligne de la
-    commune absente de l'Excel importé (comparaison sur TOUTE la commune,
-    pas seulement les rues présentes dans l'Excel — voir docstring du
-    module)."""
+    `modifier_cellules=True` : reprend TOUTE cellule différente
+    (`_appliquer_differences_completes`) pour les lignes déjà connues, sans
+    toucher aux lignes absentes de l'Excel.
+
+    `supprimer_lignes_absentes=True` : supprime toute ligne de la commune
+    absente de l'Excel importé (comparaison sur TOUTE la commune, pas
+    seulement les rues présentes dans l'Excel — voir docstring du module).
+    Indépendante de `modifier_cellules` : chacune peut être activée seule."""
     from main import _set_identification_columns  # import tardif : évite un cycle main <-> sync_service
 
     plan = PlanSynchronisation(commune=commune)
@@ -250,7 +265,7 @@ def calculer_synchronisation(
     identifiants_traites: set = set()
 
     def _corriger(valeurs_base: Dict[str, str], ligne: Dict[str, str], identifiant: str) -> bool:
-        if mode_miroir:
+        if modifier_cellules:
             return _appliquer_differences_completes(valeurs_base, ligne, identifiant, rapport)
         return _corriger_cellules_erreur(valeurs_base, ligne, column_order, identifiant, rapport)
 
@@ -347,7 +362,7 @@ def calculer_synchronisation(
             identifiant_reel, rue_officielle, numero_excel,
         )
 
-    if mode_miroir:
+    if supprimer_lignes_absentes:
         for identifiant, valeurs in base.items():
             if identifiant in identifiants_traites:
                 continue
@@ -366,7 +381,8 @@ def appliquer_plan_synchronisation(
     """Écrit réellement en base ce qu'un `PlanSynchronisation` (voir
     `calculer_synchronisation`) a calculé — aucun appel réseau ici, tout a
     déjà été décidé lors du calcul. Séparée du calcul pour permettre un
-    aperçu (voir gui.py) avant confirmation, notamment en mode miroir."""
+    aperçu (voir gui.py) avant confirmation, notamment si
+    `supprimer_lignes_absentes` est activée."""
     for identifiant, valeurs in plan.a_definir:
         progress_store.set(plan.commune, identifiant, valeurs)
     for identifiant, rue, capakey in plan.a_supprimer:
@@ -374,8 +390,8 @@ def appliquer_plan_synchronisation(
         if capakey:
             progress_store.supprimer_parcelle_sans_adresse(plan.commune, rue, capakey)
         _logger.info(
-            "Commune '%s' : parcelle %s (rue '%s') supprimée — synchronisation miroir, absente "
-            "de l'Excel importé.", plan.commune, identifiant, rue,
+            "Commune '%s' : parcelle %s (rue '%s') supprimée — absente de l'Excel importé "
+            "(option 'supprimer les lignes absentes').", plan.commune, identifiant, rue,
         )
     plan.rapport.parcelles_en_base = len(progress_store.all_for_commune(plan.commune))
     _logger.info(plan.rapport.resume())
@@ -393,10 +409,10 @@ def synchroniser_depuis_excel(
     """Synchronise `progress_store` à partir d'un Excel importé (voir
     docstring du module) — enchaîne calcul (`calculer_synchronisation`) et
     application (`appliquer_plan_synchronisation`) immédiatement, sans
-    aperçu intermédiaire : comportement historique, utilisé par le mode par
-    défaut (case "synchronisation complète" décochée). Pour un aperçu avant
-    confirmation (mode miroir), appeler ces deux fonctions séparément — voir
-    gui.py."""
+    aperçu intermédiaire : comportement historique, utilisé quand aucune des
+    deux options (`modifier_cellules`, `supprimer_lignes_absentes`) n'est
+    cochée. Pour un aperçu avant confirmation (l'une ou l'autre activée),
+    appeler ces deux fonctions séparément — voir gui.py."""
     plan = calculer_synchronisation(commune, pays, ws, excel_service, progress_store, cadastre_service)
     return appliquer_plan_synchronisation(plan, progress_store)
 
