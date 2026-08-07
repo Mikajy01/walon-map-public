@@ -481,10 +481,25 @@ class App(ctk.CTk):
 
         fenetre = ctk.CTkToplevel(self)
         fenetre.title(APP_TITLE)
-        fenetre.geometry("540x300")
-        fenetre.resizable(False, False)
+        fenetre.geometry("560x480")
+        fenetre.minsize(480, 380)
+        # Redimensionnable (contrairement à avant) : filet de sécurité si le
+        # texte prend plus de hauteur que prévu selon la police/l'échelle
+        # d'affichage de la machine — cas réel constaté (fenêtre fixe 540x300
+        # trop courte pour le contenu, les boutons Continuer/Annuler
+        # invisibles car poussés hors de la zone visible).
+        fenetre.resizable(True, True)
         fenetre.transient(self)
         fenetre.grab_set()
+
+        # Boutons empaquetés EN PREMIER avec side="bottom" : réservent leur
+        # place tout en bas en priorité, avant le texte au-dessus (qui prend
+        # le reste de l'espace disponible) — les boutons restent donc
+        # toujours visibles même si le texte déborde, contrairement à un
+        # simple empilement du haut vers le bas où le dernier élément packé
+        # peut se retrouver hors de la fenêtre.
+        boutons = ctk.CTkFrame(fenetre, fg_color="transparent")
+        boutons.pack(side="bottom", fill="x", padx=20, pady=20)
 
         ctk.CTkLabel(
             fenetre, text="Options de la synchronisation", font=ctk.CTkFont(size=15, weight="bold"),
@@ -523,8 +538,6 @@ class App(ctk.CTk):
             resultat["valeur"] = None
             fenetre.destroy()
 
-        boutons = ctk.CTkFrame(fenetre, fg_color="transparent")
-        boutons.pack(fill="x", padx=20, pady=(0, 20))
         ctk.CTkButton(boutons, text="Annuler", fg_color="gray40", command=_annuler).pack(side="right")
         ctk.CTkButton(boutons, text="Continuer", command=_valider).pack(side="right", padx=(0, 8))
 
@@ -739,10 +752,18 @@ class App(ctk.CTk):
 
         fenetre = ctk.CTkToplevel(self)
         fenetre.title(APP_TITLE)
-        fenetre.geometry("520x300")
-        fenetre.resizable(False, False)
+        fenetre.geometry("520x400")
+        fenetre.minsize(460, 340)
+        # Redimensionnable + boutons ancrés en bas en priorité : voir
+        # _demander_mode_synchronisation pour l'incident réel qui a motivé
+        # ce filet de sécurité (fenêtre fixe trop courte, boutons invisibles
+        # car poussés hors de la zone visible par le texte).
+        fenetre.resizable(True, True)
         fenetre.transient(self)
         fenetre.grab_set()
+
+        boutons = ctk.CTkFrame(fenetre, fg_color="transparent")
+        boutons.pack(side="bottom", fill="x", padx=20, pady=20)
 
         ctk.CTkLabel(
             fenetre, text="Options du recalcul", font=ctk.CTkFont(size=15, weight="bold"),
@@ -778,8 +799,6 @@ class App(ctk.CTk):
             resultat["valeur"] = None
             fenetre.destroy()
 
-        boutons = ctk.CTkFrame(fenetre, fg_color="transparent")
-        boutons.pack(fill="x", padx=20, pady=(0, 20))
         ctk.CTkButton(boutons, text="Annuler", fg_color="gray40", command=_annuler).pack(side="right")
         ctk.CTkButton(boutons, text="Lancer le recalcul", command=_valider).pack(side="right", padx=(0, 8))
 
