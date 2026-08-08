@@ -160,10 +160,20 @@ jobs:
           cd donnees
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Un 4e argument glob "output/<commune>-"*.xlsx a été présent ici
+          # un temps, censé attraper d'éventuels fichiers de sortie
+          # multi-codes-postaux qui n'ont en réalité jamais existé (main.py
+          # ne produit jamais que "output/<commune>.xlsx") — un motif glob
+          # qui ne correspond à AUCUN fichier fait échouer `git add`
+          # ENTIÈREMENT (aucun des autres chemins, pourtant valides, n'est
+          # alors indexé), silencieusement avalé par `2>/dev/null || true`
+          # juste après. Résultat réel : plus aucun run "Traitement
+          # automatique" n'a rien committé depuis l'ajout de cet argument,
+          # des heures de traitement réel perdues à chaque fois sans erreur
+          # visible ("Rien de nouveau à committer." affiché à tort). Retiré.
           git add -f "cache/${{ inputs.commune }}/http_cache.sqlite3" \
                      "logs/${{ inputs.commune }}/" \
-                     "output/${{ inputs.commune }}.xlsx" \
-                     "output/${{ inputs.commune }}-"*.xlsx 2>/dev/null || true
+                     "output/${{ inputs.commune }}.xlsx" 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "Rien de nouveau à committer."
             exit 0
