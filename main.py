@@ -212,8 +212,8 @@ def parse_args() -> argparse.Namespace:
              "dans la commune, et pour celles candidates sur plusieurs rues à "
              "la fois ne garde que la plus proche géométriquement (voir "
              "main.py::recalculer_cote_position). À lancer une fois par "
-             "commune (ex: workflow GitHub Actions \"Traiter une commune\", "
-             "option recalculer_cote_position) — les parcelles "
+             "commune (ex: workflow GitHub Actions dédié "
+             "\"Recalculer côté/position\") — les parcelles "
              "traitées normalement n'ont déjà plus ces problèmes. --limit est "
              "ignoré dans ce mode ; --code-postal, lui, est respecté (utile "
              "pour une commune fusionnée dont on ne gère qu'un sous-ensemble "
@@ -264,6 +264,39 @@ def _chemin_archive_disponible(base_dir: Path, commune: str) -> Path:
         n += 1
 
 
+_ARCHIVES_A_CONSERVER = 5
+_RE_SUFFIXE_ARCHIVE = re.compile(r"^(\d{2})-(\d{2})-(\d{4})(?: (\d+))?\.xlsx$")
+
+
+def _purger_archives_excedentaires(base_dir: Path, commune: str, garder: int = _ARCHIVES_A_CONSERVER) -> None:
+    """Supprime les copies datées les plus anciennes de cette commune
+    au-delà des `garder` dernières — sans ça, le dossier (et le dépôt
+    walon-map-data une fois committé) grossirait indéfiniment, environ 1 Mo
+    par copie archivée à chaque exécution.
+
+    Tri par date/numéro extraits DU NOM DE FICHIER (voir
+    `_chemin_archive_disponible`), jamais par date de modification du
+    fichier sur disque : sur un clone Git fraîchement récupéré (le cas
+    normal en CI), tous les fichiers partagent le même horodatage de
+    checkout, qui ne reflète en rien l'ordre chronologique réel des
+    exécutions passées."""
+    prefixe = f"{commune}-"
+    candidats: list = []
+    for chemin in base_dir.glob(f"{commune}-*.xlsx"):
+        m = _RE_SUFFIXE_ARCHIVE.match(chemin.name[len(prefixe):])
+        if not m:
+            continue
+        jour, mois, annee, n = m.groups()
+        candidats.append(((annee, mois, jour, int(n or 0)), chemin))
+    candidats.sort(key=lambda c: c[0], reverse=True)
+    for _, ancien in candidats[garder:]:
+        ancien.unlink()
+        _logger.info(
+            "Commune '%s' : archive excédentaire supprimée (au-delà des %d dernière(s) conservée(s)) : %s",
+            commune, garder, ancien.name,
+        )
+
+
 def _set_identification_columns(parcelle: Parcelle) -> None:
     parcelle.valeurs["A"] = parcelle.pays
     parcelle.valeurs["B"] = parcelle.code_postal or "/"
@@ -307,6 +340,7 @@ def traiter_commune(
     codes_postaux: Optional[List[str]] = None,
     output_path: Optional[Path] = None,
     on_progress: Optional[ProgressCallback] = None,
+    archiver_copie_datee: bool = True,
 ) -> ResultatTraitement:
     """Traite une commune de façon incrémentale.
 
@@ -545,7 +579,9 @@ def traiter_commune(
     # --code-postal éventuel de cette exécution), pour ne jamais faire
     # disparaître du fichier des lignes résolues lors d'exécutions
     # précédentes avec un filtre différent (ou sans filtre).
-    final_output_path = _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
+    final_output_path = _reconstruire_fichier_sortie(
+        commune, progress_store, excel_service, output_path, archiver_copie_datee=archiver_copie_datee,
+    )
     return ResultatTraitement(
         output_path=final_output_path,
         total_adresses=total_adresses,
@@ -561,12 +597,26 @@ def _reconstruire_fichier_sortie(
     progress_store: ProgressStore,
     excel_service: ExcelService,
     output_path: Optional[Path] = None,
+    archiver_copie_datee: bool = True,
 ) -> Path:
     """Reconstruit le fichier Excel de sortie à partir de la totalité des
     parcelles déjà résolues pour la commune — appelé par `traiter_commune`
     après chaque exécution, et par `recalculer_cote_position` après avoir
     mis à jour côté/position sur des parcelles déjà résolues (même besoin :
-    relire `progress_store`, trier, réécrire)."""
+    relire `progress_store`, trier, réécrire).
+
+    `archiver_copie_datee=True` (par défaut, CLI et GitHub Actions) : une
+    copie datée (voir `_chemin_archive_disponible`) est en plus archivée à
+    côté du fichier stable, purgée au-delà des `_ARCHIVES_A_CONSERVER`
+    dernières (voir `_purger_archives_excedentaires`) — sert de trace/audit
+    indépendante de ce que chaque exécution a réellement produit. Incident
+    réel qui a motivé son extension à `--output-dir`/GitHub Actions (avant,
+    réservée au seul chemin par défaut via `output_path is None`, donc
+    jamais déclenchée par la CI) : le workflow "Traiter une commune" a
+    perdu silencieusement des heures de traitement réel sans qu'aucun
+    fichier daté n'en garde la trace pour le remarquer plus tôt. Le GUI
+    passe `False` (l'utilisateur maîtrise déjà le nommage via « Enregistrer
+    sous… », pas d'archive automatique dans son dossier de travail)."""
     toutes_valeurs_commune = list(progress_store.all_for_commune(commune).values())
     toutes_valeurs_commune.sort(key=cle_tri_parcelle)
 
@@ -576,18 +626,13 @@ def _reconstruire_fichier_sortie(
     all_columns = ["A", "B", "C", "D", "E", "F"] + column_order
     excel_service.write_parcelles(ws, toutes_valeurs_commune, all_columns)
 
-    # `output_path is None` : appelant utilisant le chemin par défaut (CLI,
-    # GitHub Actions) — une copie datée est en plus archivée à côté du
-    # fichier stable. Le GUI fournit toujours son propre `output_path`
-    # (choisi explicitement via « Enregistrer sous… ») : pas d'archive
-    # automatique dans ce cas, l'utilisateur maîtrise déjà le nommage.
-    utilise_chemin_par_defaut = output_path is None
     final_output_path = output_path or (config.OUTPUT_DIR / f"{commune}.xlsx")
     excel_service.save(wb, final_output_path)
-    if utilise_chemin_par_defaut:
+    if archiver_copie_datee:
         chemin_archive = _chemin_archive_disponible(final_output_path.parent, commune)
         shutil.copy2(final_output_path, chemin_archive)
         _logger.info("Copie datée archivée : %s", chemin_archive)
+        _purger_archives_excedentaires(final_output_path.parent, commune)
     return final_output_path
 
 
@@ -600,6 +645,7 @@ def recalculer_cote_position(
     codes_postaux: Optional[List[str]] = None,
     on_progress: Optional[ProgressCallback] = None,
     forcer_redecouverte: bool = False,
+    archiver_copie_datee: bool = True,
 ) -> RapportRecalcul:
     """Rattrapage géométrique unique, à lancer une fois par commune, qui
     corrige en une passe tout ce qui a changé après coup dans le calcul
@@ -615,8 +661,8 @@ def recalculer_cote_position(
        de référence de Crisnée, parcelles jusqu'à 176m du tracé). Nettement
        plus coûteux que les étapes suivantes (fenêtre de recherche ~64x
        plus grande) — pour une commune déjà largement traitée, à lancer
-       de préférence via le workflow GitHub Actions "Traiter une commune"
-       (option recalculer_cote_position) plutôt qu'en local.
+       de préférence via le workflow GitHub Actions dédié
+       "Recalculer côté/position" plutôt qu'en local.
     2. Recolle les tronçons PICC d'une rue dans le bon ordre/sens (voir
        `utils/geometrie.py::_rechainer_chemins`) et recalcule côté/position
        pour TOUTES les parcelles déjà résolues des rues à plusieurs
@@ -956,7 +1002,9 @@ def recalculer_cote_position(
             progress_store.marquer_rue_commune_verifiee(commune, rue)
 
     if rapport.total:
-        _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
+        _reconstruire_fichier_sortie(
+            commune, progress_store, excel_service, output_path, archiver_copie_datee=archiver_copie_datee,
+        )
     _logger.info(rapport.resume(commune))
     return rapport
 
@@ -969,6 +1017,7 @@ def retraiter_echecs(
     excel_service: ExcelService,
     output_path: Optional[Path] = None,
     on_progress: Optional[ProgressCallback] = None,
+    archiver_copie_datee: bool = True,
 ) -> RapportEchecs:
     """Retente UNIQUEMENT les parcelles enregistrées en échec par
     `_traiter_jusqu_a_objectif` (voir `ProgressStore.enregistrer_echec`),
@@ -1015,7 +1064,9 @@ def retraiter_echecs(
         reussies += 1
 
     if reussies:
-        _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
+        _reconstruire_fichier_sortie(
+            commune, progress_store, excel_service, output_path, archiver_copie_datee=archiver_copie_datee,
+        )
     restantes = total - reussies
     _logger.info(
         "Commune '%s' : %d/%d parcelle(s) en échec retraitée(s) avec succès (%d encore en échec).",
@@ -1030,6 +1081,7 @@ def supprimer_parcelles_hors_codes_postaux(
     progress_store: ProgressStore,
     excel_service: ExcelService,
     output_path: Optional[Path] = None,
+    archiver_copie_datee: bool = True,
 ) -> int:
     """Supprime DÉFINITIVEMENT les parcelles déjà résolues de cette commune
     dont le code postal n'est PAS dans `codes_postaux_autorises`, ainsi que
@@ -1057,7 +1109,9 @@ def supprimer_parcelles_hors_codes_postaux(
                 progress_store.supprimer_parcelle_sans_adresse(commune, rue, entree["capakey"])
 
     if identifiants:
-        _reconstruire_fichier_sortie(commune, progress_store, excel_service, output_path)
+        _reconstruire_fichier_sortie(
+            commune, progress_store, excel_service, output_path, archiver_copie_datee=archiver_copie_datee,
+        )
         _logger.warning(
             "Commune '%s' : %d ligne(s) supprimée(s) définitivement (code postal hors de %s).",
             commune, len(identifiants), codes_postaux_autorises,

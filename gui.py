@@ -448,6 +448,7 @@ class App(ctk.CTk):
                 cadastre_service, layers_service, progress_store, excel_service,
                 limit=parametres["limit"], codes_postaux=parametres["codes_postaux"],
                 output_path=parametres["fichier_sortie"], on_progress=on_progress,
+                archiver_copie_datee=False,
             )
             self._message_queue.put(("done", resultat))
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
@@ -978,7 +979,7 @@ class App(ctk.CTk):
             rapport = recalculer_cote_position(
                 commune, cadastre_service, progress_store, excel_service,
                 output_path=fichier_sortie, codes_postaux=codes_postaux, on_progress=on_progress,
-                forcer_redecouverte=forcer_redecouverte,
+                forcer_redecouverte=forcer_redecouverte, archiver_copie_datee=False,
             )
             self._message_queue.put(("recalcul_done", rapport, fichier_sortie))
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
@@ -1053,7 +1054,7 @@ class App(ctk.CTk):
 
             rapport = retraiter_echecs(
                 commune, cadastre_service, layers_service, progress_store, excel_service,
-                output_path=fichier_sortie, on_progress=on_progress,
+                output_path=fichier_sortie, on_progress=on_progress, archiver_copie_datee=False,
             )
             self._message_queue.put(("retraitement_echecs_done", rapport, fichier_sortie))
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
@@ -1149,6 +1150,7 @@ class App(ctk.CTk):
             excel_service = ExcelService(Path(fichier_entree))
             n = supprimer_parcelles_hors_codes_postaux(
                 commune, codes_postaux, progress_store, excel_service, output_path=Path(fichier_sortie),
+                archiver_copie_datee=False,
             )
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
             logging.getLogger("gui").exception("Échec de la suppression hors code(s) postal(aux)")
