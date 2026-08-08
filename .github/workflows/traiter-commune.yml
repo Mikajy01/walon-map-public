@@ -86,8 +86,18 @@ jobs:
       - name: Lancer le traitement
         run: |
           set -e
+          # --duree-max-minutes 330 : marge de 10 min sous le timeout-minutes
+          # (340) du job ci-dessus - le script s'arrete proprement AVANT que
+          # GitHub n'annule le job de force, laissant le temps aux etapes de
+          # nettoyage/commit (ci-dessous) de tourner normalement. Sans ca, un
+          # job annule pour timeout peut afficher ces etapes comme "reussies"
+          # alors qu'AUCUN commit n'atterrit reellement dans walon-map-data -
+          # delai de grace trop court pour les etapes if: always() apres une
+          # annulation, limitation connue de GitHub Actions (cas reel
+          # constate : Colfontaine, 5h17 de travail perdues).
           ARGS=(--commune "${{ inputs.commune }}" --pays "${{ inputs.pays }}"
                 --rate-limit "${{ inputs.rate_limit }}"
+                --duree-max-minutes 330
                 --template "Entête walonmap (avec colonnes en plus).xlsx"
                 --cache-dir "donnees/cache/${{ inputs.commune }}"
                 --logs-dir "donnees/logs/${{ inputs.commune }}"

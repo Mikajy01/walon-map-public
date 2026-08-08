@@ -21,6 +21,7 @@ import argparse
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -173,6 +174,14 @@ def parse_args() -> argparse.Namespace:
         help="Nombre maximum de NOUVELLES parcelles à résoudre à cette exécution "
              "(les parcelles déjà traitées lors d'exécutions précédentes ne comptent pas "
              "et sont conservées). Omettre pour traiter tout ce qui reste.",
+    )
+    parser.add_argument(
+        "--duree-max-minutes", type=float, default=None,
+        help="Arrête la résolution proprement (jamais en plein milieu d'une rue) une fois ce "
+             "budget de temps écoulé, plutôt que d'attendre l'objectif — pensé pour s'arrêter "
+             "AVANT le timeout d'un workflow GitHub Actions, laissant le temps aux étapes de "
+             "nettoyage/commit de tourner normalement. Omettre pour aucune limite (comportement "
+             "usuel en local/GUI).",
     )
     parser.add_argument(
         "--rate-limit", type=float, default=config.MAX_REQUESTS_PER_SECOND,
@@ -352,6 +361,7 @@ def traiter_commune(
     output_path: Optional[Path] = None,
     on_progress: Optional[ProgressCallback] = None,
     archiver_copie_datee: bool = True,
+    duree_max_minutes: Optional[float] = None,
 ) -> ResultatTraitement:
     """Traite une commune de façon incrémentale.
 
@@ -392,7 +402,23 @@ def traiter_commune(
     boucles (découverte puis remplissage) si fourni — utilisé par
     l'interface graphique pour piloter une barre de progression sans que
     ce module dépende d'une bibliothèque UI.
-    """
+
+    `duree_max_minutes`, si fourni, arrête la résolution proprement une
+    fois ce budget écoulé — vérifié uniquement aux frontières de rue
+    (jamais en plein milieu, cohérent avec l'ordre strict de
+    `_traiter_jusqu_a_objectif` ci-dessous), donc jamais dépassé de
+    beaucoup. Pensé pour le workflow GitHub Actions "Traiter une commune"
+    (`timeout-minutes: 340`) : au lieu de laisser GitHub annuler le job de
+    force en pleine résolution — cas réel constaté, une exécution de
+    Colfontaine tuée après 5h17 de travail réel, avec les étapes de
+    nettoyage/commit affichées comme "réussies" dans l'interface GitHub
+    alors qu'AUCUN commit n'a réellement atterri dans walon-map-data,
+    limitation connue de GitHub Actions (délai de grâce trop court pour
+    les étapes `if: always()` après une annulation) — le script s'arrête
+    lui-même bien avant, laissant largement le temps aux étapes de
+    nettoyage/commit de tourner normalement, sans course contre une
+    coupure forcée. `None` (défaut) : aucune limite, comportement inchangé
+    pour un usage CLI/GUI local."""
     _logger.info("=== Traitement de la commune : %s ===", commune)
     if codes_postaux:
         _logger.info("Filtré sur le(s) code(s) postal(aux) : %s", ", ".join(codes_postaux))
@@ -546,14 +572,25 @@ def traiter_commune(
     parcelles_tentees = 0
     cible = min(objectif, len(a_faire))
     plafond_tentatives = min(len(a_faire), objectif * 2)
+    debut_resolution = time.monotonic()
+    limite_secondes = duree_max_minutes * 60 if duree_max_minutes is not None else None
+    arret_duree_max = False
 
     def _traiter_jusqu_a_objectif():
-        nonlocal parcelles_tentees
+        nonlocal parcelles_tentees, arret_duree_max
         rue_courante: Optional[str] = None
         echec_rue_courante = False
         for parcelle in a_faire:
             if parcelle.rue != rue_courante:
                 if echec_rue_courante:
+                    return
+                # Vérifiée seulement à un changement de rue (jamais en
+                # plein milieu) — mêmes garanties que l'ordre strict
+                # ci-dessus, une rue commencée est toujours menée à son
+                # terme (ou à un échec explicite), jamais interrompue à
+                # cause du budget de temps.
+                if limite_secondes is not None and time.monotonic() - debut_resolution >= limite_secondes:
+                    arret_duree_max = True
                     return
                 rue_courante = parcelle.rue
                 echec_rue_courante = False
@@ -577,6 +614,13 @@ def traiter_commune(
     ):
         if on_progress:
             on_progress("remplissage", parcelle_index + 1, cible)
+
+    if arret_duree_max:
+        _logger.info(
+            "Commune '%s' : durée maximale (%s min) atteinte, arrêtée proprement avant une "
+            "nouvelle rue — %d nouvelle(s) parcelle(s) réussie(s) cette exécution, relancez "
+            "pour continuer.", commune, duree_max_minutes, len(nouvellement_traitees),
+        )
 
     echecs = parcelles_tentees - len(nouvellement_traitees)
     if echecs > 0:
@@ -1236,6 +1280,7 @@ def main() -> int:
                 commune, args.pays,
                 cadastre_service, layers_service, progress_store, excel_service,
                 limit=args.limit, codes_postaux=args.codes_postaux, output_path=output_path,
+                duree_max_minutes=args.duree_max_minutes,
             )
             resultats.append(resultat)
         except Exception:  # noqa: BLE001 - une commune en erreur ne doit pas bloquer les suivantes
