@@ -35,8 +35,8 @@ Aucun changement de schéma SQLite ni de la logique d'écriture/lecture
 existante : compatible avec les anciens `http_cache.sqlite3` et les anciens
 fichiers Excel de sortie.
 
-Deux options indépendantes (cases à cocher, voir gui.py), chacune sans
-rapport avec l'autre — jamais bundlées ensemble, précisément pour éviter
+Trois options indépendantes (cases à cocher, voir gui.py), chacune sans
+rapport avec les autres — jamais bundlées ensemble, précisément pour éviter
 qu'activer l'une déclenche l'autre par accident (voir plus bas, incident
 réel) :
 
@@ -45,6 +45,13 @@ réel) :
   seulement ERREUR/vide comme le cas 1 ci-dessus). Ne supprime jamais rien.
 - `supprimer_lignes_absentes` : supprime de la base toute ligne de la
   commune absente de l'Excel importé (comparaison sur TOUTE la commune).
+- `considerer_rues_traitees` (voir `marquer_rues_traitees`) : marque
+  chaque rue présente dans l'Excel comme déjà vérifiée
+  (`ProgressStore.rue_deja_verifiee`), pour qu'un prochain traitement ne
+  relance pas une découverte complète des parcelles sans adresse pour ces
+  rues (~20-30s/rue) — utile quand l'Excel importé reflète déjà l'état
+  complet d'une rue dans un environnement où ce cache local n'a jamais été
+  peuplé. N'ajoute, ne modifie ni ne supprime aucune ligne de données.
 
 Calcul (`calculer_synchronisation`) et écriture (`appliquer_plan_synchronisation`)
 sont deux étapes séparées justement pour permettre un aperçu chiffré avant
@@ -415,6 +422,75 @@ def synchroniser_depuis_excel(
     appeler ces deux fonctions séparément — voir gui.py."""
     plan = calculer_synchronisation(commune, pays, ws, excel_service, progress_store, cadastre_service)
     return appliquer_plan_synchronisation(plan, progress_store)
+
+
+def marquer_rues_traitees(
+    commune: str, ws: Worksheet, excel_service: ExcelService, progress_store: ProgressStore,
+) -> int:
+    """Marque comme "vérifiées" (`ProgressStore.rue_deja_verifiee`) toutes
+    les rues présentes dans l'Excel importé pour lesquelles ce n'est pas
+    déjà le cas — option `considerer_rues_traitees` (voir gui.py),
+    indépendante des deux autres. Évite qu'un prochain traitement
+    (`main.py::traiter_commune`) ne relance une découverte complète des
+    parcelles sans adresse (~20-30s/rue, tracé PICC + requêtes CADMAP) pour
+    des rues dont l'Excel importé montre déjà l'état complet — typique
+    d'une commune reconstituée à la main ou reprise dans un environnement
+    où `rues_verifiees` n'a jamais été peuplée localement, alors que
+    `parcelle_resultats` (via l'Excel réimporté) l'est déjà.
+
+    À appeler APRÈS `appliquer_plan_synchronisation` : relit
+    `progress_store` (donc les valeurs à jour, y compris les lignes tout
+    juste ajoutées ou corrigées) pour reconstituer, par rue, les parcelles
+    sans adresse déjà connues (identifiant `|CAPAKEY:`) et les enregistrer
+    via `ProgressStore.enregistrer_parcelles_sans_adresse` — même méthode
+    que la découverte normale, marque la rue vérifiée ET conserve ces
+    parcelles (liste vide acceptée pour une rue purement adressée). La
+    géométrie de chaque parcelle n'est pas connue ici (jamais conservée
+    dans l'Excel) : laissée à `None`, sans risque —
+    `CadastreService.point_pour_identifiant` la retrouve par une requête
+    ciblée dédiée quand nécessaire (rattrapage côté/position), jamais
+    depuis ce cache. `cote`/`position_rue` sont repris s'ils sont déjà
+    connus (clés internes `_cote`/`_position` du `ProgressStore`), sinon
+    laissés `None` — cas déjà géré ailleurs (rue jamais recalculée, voir
+    `parcelles_sans_adresse` dans cache_service.py).
+
+    Renvoie le nombre de rues nouvellement marquées (les rues déjà
+    vérifiées, cas normal pour une commune déjà traitée par l'outil, sont
+    laissées intactes plutôt que réécrites)."""
+    column_order = ["A", "B", "C", "D", "E", "F"] + list(config.COLUMN_RULES.keys())
+    lignes_excel = excel_service.lire_donnees_existantes(ws, column_order)
+    rues_excel = {(ligne.get("D") or "").strip() for ligne in lignes_excel}
+    rues_excel.discard("")
+
+    base = progress_store.all_for_commune(commune)
+    par_rue: Dict[str, List[Dict[str, str]]] = {rue: [] for rue in rues_excel}
+    for identifiant, valeurs in base.items():
+        if "|CAPAKEY:" not in identifiant:
+            continue
+        rue = valeurs.get("D", "")
+        if rue not in par_rue:
+            continue
+        par_rue[rue].append({
+            "capakey": identifiant.rsplit("|CAPAKEY:", 1)[-1],
+            "numero_cadastral": valeurs.get("F"),
+            "code_postal": valeurs.get("B"),
+            "geometry": None,
+            "cote": valeurs.get("_cote"),
+            "position_rue": valeurs.get("_position"),
+        })
+
+    rues_marquees = 0
+    for rue in sorted(rues_excel):
+        if progress_store.rue_deja_verifiee(commune, rue):
+            continue
+        progress_store.enregistrer_parcelles_sans_adresse(commune, rue, par_rue[rue])
+        rues_marquees += 1
+    if rues_marquees:
+        _logger.info(
+            "Commune '%s' : %d rue(s) marquée(s) déjà traitée(s) depuis l'Excel importé "
+            "(option 'considérer les rues comme déjà traitées').", commune, rues_marquees,
+        )
+    return rues_marquees
 
 
 def reecrire_excel_depuis_base(

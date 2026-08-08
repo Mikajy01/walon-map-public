@@ -87,25 +87,43 @@ class ExcelService:
     def lire_donnees_existantes(self, ws: Worksheet, column_order: List[str]) -> List[Dict[str, str]]:
         """Relit les données d'un Excel déjà rempli — inverse de
         `write_parcelles`, utilisé pour importer un fichier corrigé à la
-        main (voir services/sync_service.py). S'arrête à la première ligne
-        vide (colonne A), comme `write_parcelles` les produit sans trou.
+        main (voir services/sync_service.py). Parcourt TOUTES les lignes
+        jusqu'à `ws.max_row`, en ignorant individuellement toute ligne vide
+        (colonne A) plutôt que de s'arrêter à la première rencontrée.
+
+        Ancien comportement (corrigé) : s'arrêtait à la première ligne vide,
+        en supposant qu'`write_parcelles` ne produit jamais de trou — vrai
+        pour un export automatique, faux dès qu'un collaborateur modifie le
+        fichier à la main (une ligne entière sélectionnée puis effacée avec
+        la touche Suppr, par exemple, laisse une ligne vide au milieu sans
+        décaler les suivantes). Incident réel : un Excel de ~1900 lignes
+        n'en relisait que 40 (tout ce qui précédait la première ligne vide
+        rencontrée) — combiné à l'option `supprimer_lignes_absentes` (voir
+        sync_service.py), la quasi-totalité de la commune a été supprimée
+        de la base car considérée comme absente de l'Excel.
 
         Les valeurs numériques (colonnes NUMERIC_WHEN_POSSIBLE_COLUMNS,
         stockées en nombre Excel réel par `write_parcelles`) sont
         reconverties en `str` pour rester comparables telles quelles aux
         valeurs de `ProgressStore` (qui stocke tout en texte, JSON)."""
         lignes: List[Dict[str, str]] = []
-        row_idx = FIRST_DATA_ROW
-        while True:
+        lignes_vides_ignorees = 0
+        for row_idx in range(FIRST_DATA_ROW, ws.max_row + 1):
             premiere_valeur = ws[f"{column_order[0]}{row_idx}"].value
             if premiere_valeur is None or str(premiere_valeur).strip() == "":
-                break
+                lignes_vides_ignorees += 1
+                continue
             valeurs: Dict[str, str] = {}
             for col in column_order:
                 brute = ws[f"{col}{row_idx}"].value
                 valeurs[col] = "" if brute is None else str(brute)
             lignes.append(valeurs)
-            row_idx += 1
+        if lignes_vides_ignorees:
+            _logger.warning(
+                "%d ligne(s) vide(s) (colonne %s) ignorée(s) au milieu du fichier importé — "
+                "probablement effacées à la main sans être supprimées.",
+                lignes_vides_ignorees, column_order[0],
+            )
         _logger.info("%d ligne(s) relue(s) depuis un fichier Excel existant.", len(lignes))
         return lignes
 

@@ -54,6 +54,7 @@ from services.sync_service import (
     RapportSynchronisation,
     appliquer_plan_synchronisation,
     calculer_synchronisation,
+    marquer_rues_traitees,
     reecrire_excel_depuis_base,
     synchroniser_depuis_excel,
 )
@@ -455,8 +456,8 @@ class App(ctk.CTk):
 
     # -- Import d'un Excel corrigé (reprise des cellules ERREUR/vides) -------
 
-    def _demander_options_synchronisation(self) -> Optional[Tuple[bool, bool]]:
-        """Popup de confirmation avec DEUX cases à cocher indépendantes,
+    def _demander_options_synchronisation(self) -> Optional[Tuple[bool, bool, bool]]:
+        """Popup de confirmation avec TROIS cases à cocher indépendantes,
         affiché avant chaque import — même principe que
         `_demander_forcer_redecouverte`.
 
@@ -474,7 +475,14 @@ class App(ctk.CTk):
         avant toute suppression réelle (voir `_gerer_apercu_synchronisation`)
         — rien n'est modifié rien qu'en cochant cette case.
 
-        Volontairement DEUX cases séparées, jamais bundlées sous une seule
+        "Considérer les rues de l'Excel comme déjà traitées" : marque
+        chaque rue de l'Excel comme déjà vérifiée (voir
+        `sync_service.marquer_rues_traitees`), pour qu'un prochain
+        traitement ne relance pas une découverte complète (~20-30s/rue) sur
+        des rues déjà connues. N'ajoute, ne modifie ni ne supprime aucune
+        ligne de données — sans rapport avec les deux cases ci-dessus.
+
+        Volontairement TROIS cases séparées, jamais bundlées sous une seule
         option : incident réel — un collaborateur a coché une case unique
         "synchronisation complète (miroir)" pour reprendre des cellules
         corrigées à la main, sans réaliser que ça activait AUSSI la
@@ -482,15 +490,15 @@ class App(ctk.CTk):
         lignes à 40. Cocher "modifier" seul ne peut plus jamais supprimer
         quoi que ce soit.
 
-        Renvoie `(modifier_cellules, supprimer_lignes_absentes)` si
-        l'utilisateur confirme, `None` s'il annule (l'import ne doit alors
-        pas démarrer)."""
-        resultat: Dict[str, Optional[Tuple[bool, bool]]] = {"valeur": None}
+        Renvoie `(modifier_cellules, supprimer_lignes_absentes,
+        considerer_rues_traitees)` si l'utilisateur confirme, `None` s'il
+        annule (l'import ne doit alors pas démarrer)."""
+        resultat: Dict[str, Optional[Tuple[bool, bool, bool]]] = {"valeur": None}
 
         fenetre = ctk.CTkToplevel(self)
         fenetre.title(APP_TITLE)
-        fenetre.geometry("560x560")
-        fenetre.minsize(480, 440)
+        fenetre.geometry("560x680")
+        fenetre.minsize(480, 480)
         # Redimensionnable (contrairement à avant) : filet de sécurité si le
         # texte prend plus de hauteur que prévu selon la police/l'échelle
         # d'affichage de la machine — cas réel constaté (fenêtre fixe 540x300
@@ -543,10 +551,25 @@ class App(ctk.CTk):
                 "demandés avant toute suppression réelle — rien n'est appliqué en cochant "
                 "simplement cette case. Option indépendante de celle du dessus."
             ),
+        ).pack(anchor="w", padx=20, pady=(0, 16))
+
+        case_rues_traitees = ctk.CTkCheckBox(
+            fenetre, text="Considérer les rues de l'Excel comme déjà traitées",
+        )
+        case_rues_traitees.pack(anchor="w", padx=20, pady=(0, 4))
+        ctk.CTkLabel(
+            fenetre, wraplength=490, justify="left", text_color=("gray30", "gray70"),
+            text=(
+                "Évite qu'un prochain traitement ne relance une découverte complète "
+                "(~20-30s/rue) sur les rues déjà présentes dans cet Excel. N'ajoute, ne "
+                "modifie ni ne supprime aucune ligne de données."
+            ),
         ).pack(anchor="w", padx=20, pady=(0, 8))
 
         def _valider() -> None:
-            resultat["valeur"] = (bool(case_modifier.get()), bool(case_supprimer.get()))
+            resultat["valeur"] = (
+                bool(case_modifier.get()), bool(case_supprimer.get()), bool(case_rues_traitees.get()),
+            )
             fenetre.destroy()
 
         def _annuler() -> None:
@@ -583,7 +606,7 @@ class App(ctk.CTk):
         options = self._demander_options_synchronisation()
         if options is None:
             return
-        modifier_cellules, supprimer_lignes_absentes = options
+        modifier_cellules, supprimer_lignes_absentes, considerer_rues_traitees = options
 
         self._en_cours = True
         self.bouton_lancer.configure(state="disabled")
@@ -604,16 +627,19 @@ class App(ctk.CTk):
         if modifier_cellules or supprimer_lignes_absentes:
             thread = threading.Thread(
                 target=self._executer_calcul_synchronisation,
-                args=(commune, pays, Path(chemin), modifier_cellules, supprimer_lignes_absentes),
+                args=(commune, pays, Path(chemin), modifier_cellules, supprimer_lignes_absentes, considerer_rues_traitees),
                 daemon=True,
             )
         else:
             thread = threading.Thread(
-                target=self._executer_synchronisation, args=(commune, pays, Path(chemin)), daemon=True,
+                target=self._executer_synchronisation,
+                args=(commune, pays, Path(chemin), considerer_rues_traitees), daemon=True,
             )
         thread.start()
 
-    def _executer_synchronisation(self, commune: str, pays: str, chemin: Path) -> None:
+    def _executer_synchronisation(
+        self, commune: str, pays: str, chemin: Path, considerer_rues_traitees: bool,
+    ) -> None:
         """Tourne dans un thread d'arrière-plan, comme `_executer` : voir
         `services/sync_service.py` pour la logique de correspondance et de
         correction elle-même (aucune duplication ici). `cadastre_service`
@@ -621,9 +647,10 @@ class App(ctk.CTk):
         l'Excel absente de la base avant de l'y ajouter (voir
         sync_service.py) — jamais de donnée inventée à partir du seul
         texte de l'Excel. Utilisé uniquement si aucune des deux options
-        (modifier/supprimer) n'est cochée — voir
+        destructives/écrasantes (modifier/supprimer) n'est cochée — voir
         `_executer_calcul_synchronisation` sinon, qui nécessite un aperçu
-        avant application."""
+        avant application. `considerer_rues_traitees` reste indépendante :
+        applicable ici comme dans l'autre chemin."""
         try:
             cache_service = CacheService(config.CACHE_DIR)
             progress_store = ProgressStore(config.CACHE_DIR)
@@ -641,6 +668,8 @@ class App(ctk.CTk):
             # ouvert dans Excel), rien n'est perdu, seul l'aperçu immédiat
             # manque.
             rapport = synchroniser_depuis_excel(commune, pays, ws, excel_service, progress_store, cadastre_service)
+            if considerer_rues_traitees:
+                marquer_rues_traitees(commune, ws, excel_service, progress_store)
 
             try:
                 reecrire_excel_depuis_base(commune, excel_service, progress_store, chemin)
@@ -655,15 +684,18 @@ class App(ctk.CTk):
 
     def _executer_calcul_synchronisation(
         self, commune: str, pays: str, chemin: Path,
-        modifier_cellules: bool, supprimer_lignes_absentes: bool,
+        modifier_cellules: bool, supprimer_lignes_absentes: bool, considerer_rues_traitees: bool,
     ) -> None:
         """Tourne dans un thread d'arrière-plan : calcule une
-        synchronisation avec au moins une des deux options activées, SANS
-        rien écrire en base (voir `sync_service.calculer_synchronisation`)
-        — nécessaire pour afficher un aperçu chiffré avant confirmation. Le
-        plan calculé revient via la queue pour être présenté sur le fil
-        principal (voir `_gerer_apercu_synchronisation`) ; l'application
-        réelle n'a lieu qu'après confirmation explicite."""
+        synchronisation avec au moins une des deux options destructives/
+        écrasantes activées, SANS rien écrire en base (voir
+        `sync_service.calculer_synchronisation`) — nécessaire pour afficher
+        un aperçu chiffré avant confirmation. Le plan calculé revient via la
+        queue pour être présenté sur le fil principal (voir
+        `_gerer_apercu_synchronisation`) ; l'application réelle n'a lieu
+        qu'après confirmation explicite. `considerer_rues_traitees` n'entre
+        pas dans le calcul du plan (elle ne touche aucune ligne de données),
+        simplement transmise pour être appliquée après confirmation."""
         try:
             cache_service = CacheService(config.CACHE_DIR)
             progress_store = ProgressStore(config.CACHE_DIR)
@@ -680,14 +712,16 @@ class App(ctk.CTk):
                 commune, pays, ws, excel_service, progress_store, cadastre_service,
                 modifier_cellules=modifier_cellules, supprimer_lignes_absentes=supprimer_lignes_absentes,
             )
-            self._message_queue.put(("sync_preview", plan, progress_store, excel_service, chemin))
+            self._message_queue.put(
+                ("sync_preview", plan, progress_store, excel_service, chemin, ws, considerer_rues_traitees)
+            )
         except Exception as exc:  # noqa: BLE001 — remonté proprement à l'UI
             logging.getLogger("gui").exception("Échec du calcul de la synchronisation")
             self._message_queue.put(("error", str(exc)))
 
     def _gerer_apercu_synchronisation(
         self, plan: PlanSynchronisation, progress_store: ProgressStore,
-        excel_service: ExcelService, chemin: Path,
+        excel_service: ExcelService, chemin: Path, ws, considerer_rues_traitees: bool,
     ) -> None:
         """Tourne sur le fil principal (appelé depuis `_traiter_message`) :
         affiche l'aperçu chiffré d'un `PlanSynchronisation`, puis lance
@@ -699,9 +733,17 @@ class App(ctk.CTk):
         que `_supprimer_hors_code_postal`) n'est demandée que si CE plan
         supprime effectivement des lignes (`rapport.lignes_supprimees > 0`)
         — une synchronisation qui ne fait qu'ajouter/modifier, sans jamais
-        supprimer, n'a pas besoin de ce niveau de friction supplémentaire."""
+        supprimer, n'a pas besoin de ce niveau de friction supplémentaire.
+
+        Avertissement renforcé si la suppression concerne plus de la moitié
+        de la commune : incident réel (voir services/sync_service.py) où un
+        bug de lecture Excel faisait passer une commune de plusieurs
+        milliers de lignes à 40 — corrigé, mais ce garde-fou reste utile
+        pour tout autre Excel incomplet importé par erreur."""
         rapport = plan.rapport
         supprime_des_lignes = rapport.lignes_supprimees > 0
+        total_avant = rapport.parcelles_en_base + rapport.lignes_supprimees
+        proportion_supprimee = (rapport.lignes_supprimees / total_avant) if total_avant else 0.0
         texte_apercu = (
             f"Aperçu de la synchronisation pour « {plan.commune} » — RIEN n'est encore "
             f"appliqué :\n\n"
@@ -711,6 +753,12 @@ class App(ctk.CTk):
         )
         if supprime_des_lignes:
             texte_apercu += f"{rapport.lignes_supprimees} ligne(s) seront SUPPRIMÉES DÉFINITIVEMENT\n"
+        if proportion_supprimee > 0.5:
+            texte_apercu += (
+                f"\n⚠ Cela représente {proportion_supprimee:.0%} de la commune ({total_avant} ligne(s) "
+                f"actuellement en base) — vérifie que l'Excel importé est bien complet et à jour avant "
+                f"de continuer.\n"
+            )
         texte_apercu += "\nContinuer ?"
 
         confirme = messagebox.askyesno(APP_TITLE, texte_apercu, icon="warning" if supprime_des_lignes else "question")
@@ -735,21 +783,26 @@ class App(ctk.CTk):
         self.label_statut.configure(text="Application de la synchronisation en cours…")
         thread = threading.Thread(
             target=self._executer_application_synchronisation,
-            args=(plan, progress_store, excel_service, chemin),
+            args=(plan, progress_store, excel_service, chemin, ws, considerer_rues_traitees),
             daemon=True,
         )
         thread.start()
 
     def _executer_application_synchronisation(
         self, plan: PlanSynchronisation, progress_store: ProgressStore,
-        excel_service: ExcelService, chemin: Path,
+        excel_service: ExcelService, chemin: Path, ws, considerer_rues_traitees: bool,
     ) -> None:
         """Tourne dans un thread d'arrière-plan : écrit réellement en base
         le `PlanSynchronisation` déjà calculé et confirmé (voir
         `sync_service.appliquer_plan_synchronisation`) — aucun appel réseau
-        ici, tout a déjà été décidé lors du calcul."""
+        ici, tout a déjà été décidé lors du calcul. `marquer_rues_traitees`
+        est appelée APRÈS (donc sur la base à jour, lignes tout juste
+        ajoutées/corrigées comprises) si l'option correspondante est
+        cochée."""
         try:
             rapport = appliquer_plan_synchronisation(plan, progress_store)
+            if considerer_rues_traitees:
+                marquer_rues_traitees(plan.commune, ws, excel_service, progress_store)
             try:
                 reecrire_excel_depuis_base(plan.commune, excel_service, progress_store, chemin)
             except PermissionError:
