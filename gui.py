@@ -1199,6 +1199,21 @@ class App(ctk.CTk):
                     f" — {resultat.echecs} échec(s) pendant cette exécution, pas perdu(s), "
                     f"retenté(s) automatiquement au prochain lancement."
                 )
+            # Voir main.py::ResultatTraitement.parcelles_manquantes_par_rue :
+            # signale explicitement, pour le suivi manuel, toute rue déjà
+            # commencée en haut du fichier mais pas encore complète (ne
+            # devrait plus survenir que sur échec, puisque le traitement
+            # n'entame plus jamais une nouvelle rue tant qu'une précédente
+            # reste incomplète).
+            if resultat.parcelles_manquantes_par_rue:
+                total_manquantes = sum(resultat.parcelles_manquantes_par_rue.values())
+                statut += (
+                    f" — {total_manquantes} parcelle(s) manquante(s) pour "
+                    f"{len(resultat.parcelles_manquantes_par_rue)} rue(s) déjà commencée(s) en haut "
+                    f"du fichier."
+                )
+            else:
+                statut += " — 0 parcelle manquante pour les rues en haut, le traitement peut continuer."
             self.label_statut.configure(text=statut)
             self.bouton_ouvrir_dossier.configure(state="normal")
             if resultat.echecs > 0:

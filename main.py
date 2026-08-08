@@ -21,7 +21,7 @@ import argparse
 import re
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -55,14 +55,24 @@ class ResultatTraitement:
     (aux) filtré(s) si `--code-postal` était utilisé — voir `filtre_actif`).
 
     `echecs` : nombre de parcelles qui ont échoué PENDANT cette exécution et
-    ont été automatiquement remplacées par la suivante dans la file pour ne
+    ont été automatiquement remplacées par une autre de la MÊME rue pour ne
     pas faire baisser le total obtenu (voir `_traiter_jusqu_a_objectif`) —
     jamais enregistrées comme traitées, donc jamais perdues, seulement
     reportées au prochain lancement. Exposé ici (plutôt que seulement
     journalisé) pour que l'appelant (GUI) puisse le mettre en évidence dans
     le résumé final plutôt que de le laisser uniquement dans le journal qui
     défile — demandé après qu'un utilisateur ait douté que ce décompte soit
-    vraiment signalé quelque part."""
+    vraiment signalé quelque part.
+
+    `parcelles_manquantes_par_rue` : {rue: nombre de parcelles encore non
+    résolues} pour chaque rue déjà commencée (au moins une parcelle
+    résolue) mais pas encore complète — ne devrait plus survenir que sur
+    échec (voir `echecs`) ou tant qu'une rue plus ancienne n'a pas encore
+    été rattrapée au rayon élargi, `_traiter_jusqu_a_objectif` n'entamant
+    plus jamais une nouvelle rue tant qu'une précédente reste incomplète.
+    Dict vide si aucune rue commencée n'est incomplète — signal explicite
+    pour le suivi manuel (une rue "en haut" du fichier ne doit jamais
+    rester incomplète pendant qu'une rue plus bas a déjà avancé)."""
 
     output_path: Path
     total_adresses: int
@@ -70,6 +80,7 @@ class ResultatTraitement:
     restantes: int
     filtre_actif: bool
     echecs: int = 0
+    parcelles_manquantes_par_rue: Dict[str, int] = field(default_factory=dict)
 
     @property
     def termine(self) -> bool:
@@ -418,8 +429,27 @@ def traiter_commune(
     ):
         if on_progress:
             on_progress("découverte", rue_index + 1, len(rues))
+        # Une rue jamais encore traitée découvre déjà tout au rayon ACTUEL
+        # (`force=False` suffit, `rue_deja_verifiee` est alors False de
+        # toute façon) et se retrouve marquée `rue_redecouverte_rayon_elargi`
+        # dès cette première découverte (voir CadastreService.
+        # _parcelles_cadastrales_sans_adresse) — donc aucun coût
+        # supplémentaire ici pour les rues à venir. Seules les rues déjà
+        # vérifiées AVANT un élargissement du rayon (25m→200m) restent
+        # bloquées sur leur ancien résultat, potentiellement incomplet, tant
+        # que rien ne force explicitement une redécouverte — jusqu'ici
+        # seulement via le rattrapage séparé `recalculer_cote_position`
+        # (étape 1), qui peut tourner bien après que le traitement normal a
+        # déjà avancé sur les rues suivantes (cas réel : Rue Moranfayt,
+        # Dour — parcelles 1222R/1222S retrouvées seulement après coup,
+        # alors que le traitement avait déjà atteint Rue Mouligneau). Forcer
+        # ici comble cet écart directement dans le flux normal, une seule
+        # fois par rue (le marquage empêche toute redécouverte répétée).
+        force_redecouverte = not progress_store.rue_redecouverte_rayon_elargi(commune, rue)
         try:
-            parcelles = cadastre_service.lister_parcelles(pays, commune, rue, codes_postaux=codes_postaux)
+            parcelles = cadastre_service.lister_parcelles(
+                pays, commune, rue, codes_postaux=codes_postaux, force=force_redecouverte,
+            )
         except Exception:  # noqa: BLE001
             _logger.exception("Échec de découverte des adresses pour la rue '%s', rue ignorée.", rue)
             continue
@@ -487,28 +517,31 @@ def traiter_commune(
             commune, parcelles_retentees, cellules_corrigees,
         )
 
-    # Une parcelle qui échoue (`Exception` inattendue, ex: incident réseau
-    # après épuisement des réessais) est remplacée par la suivante dans la
-    # file plutôt que de faire simplement baisser le total de cette
-    # exécution : sans ça, `--limit 550` avec 18 échecs donnait 532
-    # nouvelles parcelles au lieu de 550 (observé en conditions réelles),
-    # même si la parcelle manquée est de toute façon retentée un jour
-    # (jamais enregistrée, donc redécouverte au prochain lancement — voir
-    # plus haut) — autant ne pas attendre une exécution de plus quand il
-    # reste des parcelles disponibles pour combler l'écart tout de suite.
+    # `a_faire` est déjà groupée par rue dans l'ordre alphabétique (voir la
+    # boucle de découverte ci-dessus, qui itère `rues` triées) — la boucle
+    # ci-dessous en profite pour ne JAMAIS entamer une nouvelle rue tant que
+    # la précédente n'est pas entièrement résolue : sur un échec (`Exception`
+    # inattendue, ex: incident réseau après épuisement des réessais), elle
+    # continue à essayer les parcelles suivantes de la MÊME rue (pour
+    # compenser sans pour autant dépasser une frontière de rue), mais
+    # s'arrête complètement dès que la rue suivante serait sur le point de
+    # commencer alors que la précédente a eu au moins un échec — quitte à
+    # résoudre moins que l'objectif demandé cette exécution. Décision
+    # explicite de l'utilisateur : un suivi manuel fiable (une rue "en
+    # haut" du fichier jamais laissée incomplète pendant qu'une rue plus
+    # bas a déjà avancé) prime désormais sur le fait de toujours livrer
+    # exactement l'objectif demandé (cas réel : Rue Moranfayt, Dour,
+    # incomplète alors que Rue Mouligneau, plus bas, avait déjà des lignes
+    # résolues). Une parcelle en échec n'est de toute façon jamais perdue
+    # (jamais enregistrée comme traitée, redécouverte au prochain
+    # lancement — voir plus haut).
     #
-    # La compensation est bornée à 2x l'objectif plutôt qu'illimitée
-    # (jusqu'à épuisement de `a_faire`) : un run GitHub Actions est
-    # plafonné à 6h par GitHub (voir timeout-minutes dans le workflow),
-    # indépendamment du quota de minutes/mois (qui lui ne s'applique plus,
-    # dépôt public) — un taux d'échec anormalement élevé (ex: panne réseau
-    # partielle côté Géoportail) ne doit pas faire tenter la totalité de la
-    # file d'une commune en un seul run et risquer de ne rien terminer
-    # avant la coupure. 2x couvre largement un taux d'échec réaliste (18
-    # échecs sur 550, soit ~3%, dans le cas observé ci-dessus) sans risque
-    # d'emballement ; aucune parcelle n'est perdue si le plafond est
-    # atteint avant l'objectif, elle est simplement retentée au run
-    # suivant (jamais enregistrée tant qu'elle n'a pas réussi).
+    # `plafond_tentatives` (2x objectif) reste comme garde-fou : un run
+    # GitHub Actions est plafonné à 6h (voir timeout-minutes dans le
+    # workflow) — un taux d'échec anormalement élevé au sein d'une seule
+    # rue géante ne doit pas faire tenter indéfiniment la même rue. Rarement
+    # atteint désormais, la compensation ne dépassant plus les frontières
+    # de rue.
     nouvellement_traitees: List[Parcelle] = []
     parcelles_tentees = 0
     cible = min(objectif, len(a_faire))
@@ -516,7 +549,14 @@ def traiter_commune(
 
     def _traiter_jusqu_a_objectif():
         nonlocal parcelles_tentees
+        rue_courante: Optional[str] = None
+        echec_rue_courante = False
         for parcelle in a_faire:
+            if parcelle.rue != rue_courante:
+                if echec_rue_courante:
+                    return
+                rue_courante = parcelle.rue
+                echec_rue_courante = False
             if len(nouvellement_traitees) >= objectif or parcelles_tentees >= plafond_tentatives:
                 return
             parcelles_tentees += 1
@@ -525,6 +565,7 @@ def traiter_commune(
             except Exception as exc:  # noqa: BLE001 - ne jamais interrompre le traitement des autres parcelles
                 _logger.exception("Échec inattendu pour la parcelle %s, ligne ignorée.", parcelle.identifiant)
                 progress_store.enregistrer_echec(commune, parcelle, str(exc))
+                echec_rue_courante = True
                 continue
             progress_store.set(commune, parcelle.identifiant, parcelle.valeurs)
             progress_store.supprimer_echec(commune, parcelle.identifiant)
@@ -574,6 +615,36 @@ def traiter_commune(
         "" if not codes_postaux else f" [dans le filtre code(s) postal(aux) {codes_postaux}]",
     )
 
+    # Récapitulatif dédié aux rues "en haut" du fichier (déjà commencées —
+    # au moins une parcelle résolue avant ou pendant cette exécution) qui
+    # ne sont malgré tout pas encore complètes — gratuit, aucun appel
+    # réseau supplémentaire, à partir des données déjà collectées
+    # ci-dessus. Avec l'ordre strict imposé par `_traiter_jusqu_a_objectif`,
+    # ce cas ne devrait plus survenir qu'en présence d'échecs (une rue
+    # s'arrête au milieu) ou tant que des rues plus anciennes n'ont pas
+    # encore été rattrapées au rayon élargi (voir plus haut) — sert de
+    # signal explicite pour le suivi manuel plutôt que de laisser deviner.
+    nouvellement_traitees_ids = {p.identifiant for p in nouvellement_traitees}
+    encore_a_faire = [p for p in a_faire if p.identifiant not in nouvellement_traitees_ids]
+    rues_commencees = {p.rue for p in deja_faites} | {p.rue for p in nouvellement_traitees}
+    parcelles_manquantes_par_rue: Dict[str, int] = {}
+    for p in encore_a_faire:
+        if p.rue in rues_commencees:
+            parcelles_manquantes_par_rue[p.rue] = parcelles_manquantes_par_rue.get(p.rue, 0) + 1
+
+    if parcelles_manquantes_par_rue:
+        total_manquantes = sum(parcelles_manquantes_par_rue.values())
+        detail = ", ".join(f"{rue} ({n})" for rue, n in sorted(parcelles_manquantes_par_rue.items()))
+        _logger.warning(
+            "Commune '%s' : %d parcelle(s) manquante(s) pour %d rue(s) déjà commencée(s) en haut "
+            "du fichier : %s.", commune, total_manquantes, len(parcelles_manquantes_par_rue), detail,
+        )
+    else:
+        _logger.info(
+            "Commune '%s' : 0 parcelle manquante pour les rues en haut, le traitement peut "
+            "continuer.", commune,
+        )
+
     # Le fichier de sortie est TOUJOURS reconstruit à partir de la totalité
     # des parcelles déjà résolues pour la commune (indépendamment du filtre
     # --code-postal éventuel de cette exécution), pour ne jamais faire
@@ -589,6 +660,7 @@ def traiter_commune(
         restantes=restantes,
         filtre_actif=bool(codes_postaux),
         echecs=echecs,
+        parcelles_manquantes_par_rue=parcelles_manquantes_par_rue,
     )
 
 
