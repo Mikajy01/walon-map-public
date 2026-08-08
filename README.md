@@ -27,20 +27,35 @@ tourne en arrière-plan sans geler la fenêtre.
 python gui.py
 ```
 
-**Version portable (.exe)** : `build.bat` construit un exécutable Windows
-autonome avec PyInstaller (aucune installation de Python requise sur la
-machine cible) :
+**Version portable (.exe)** : `build-onefile.bat` et `build-onedir.bat`
+construisent chacun un exécutable Windows autonome avec PyInstaller (aucune
+installation de Python requise sur la machine cible) — deux scripts
+séparés (au lieu d'un seul `build.bat` combiné) pour contourner un bug
+`cmd.exe` jamais élucidé qui se produisait de façon fiable en plein milieu
+d'une construction PyInstaller enchaînée dans un script plus long :
 
 ```bash
-build.bat
+build-onefile.bat
+REM ou
+build-onedir.bat
 ```
 
-Produit `dist\Walonmap.exe` (+ `dist\data\`). Pour distribuer l'application,
-copier tout le dossier `dist` ; les dossiers `cache\`, `logs\`, `output\`
-sont créés automatiquement à côté de l'exécutable au premier lancement (le
-programme détecte s'il tourne en exécutable empaqueté et adapte ses chemins
-en conséquence — voir `config.py`), donc l'ensemble reste déplaçable tel
-quel (clé USB, autre PC) tout en conservant sa progression.
+Sans argument, demande interactivement la version à construire (Entrée
+pour garder l'actuelle) ; avec un argument (ex: `build-onefile.bat 1.3.0`),
+build non interactif pour cette version.
+
+`build-onefile.bat` produit `dist\onefile\Walonmap-<version>.exe` (un seul
+fichier) ; `build-onedir.bat` produit
+`dist\onedir\Walonmap-<version>\Walonmap-<version>.exe` (+ dépendances en
+fichiers séparés à côté). Le mode onefile déclenche parfois un faux positif
+antivirus (comportement heuristique proche d'un dropper) sur certaines
+machines — privilégier onedir dans ce cas. Pour distribuer l'application,
+copier le dossier complet correspondant (avec son dossier `data\`) ; les
+dossiers `cache\`, `logs\`, `output\` sont créés automatiquement à côté de
+l'exécutable au premier lancement (le programme détecte s'il tourne en
+exécutable empaqueté et adapte ses chemins en conséquence — voir
+`config.py`), donc l'ensemble reste déplaçable tel quel (clé USB, autre PC)
+tout en conservant sa progression.
 
 ### Accès par commune (copies vendues à des tiers)
 
@@ -55,7 +70,7 @@ toucher au client) coupe la copie déjà distribuée dès son prochain
 lancement — nécessite donc une connexion internet à chaque lancement.
 
 Gestion des accès (réservée au propriétaire, jamais empaqueté dans l'exe —
-voir `build.bat`) :
+voir `build-onefile.bat`/`build-onedir.bat`) :
 
 ```bash
 python outils/gerer_licences.py generer --commune Chimay   # affiche le mot de passe à transmettre
@@ -70,23 +85,14 @@ contrôle explicite sur ce qui est rendu public.
 
 ## Exécution automatique via GitHub Actions (sans utiliser son propre PC)
 
-Ce dépôt (le code) est **public** : les minutes GitHub Actions y sont
-gratuites et illimitées, contrairement à un dépôt privé (2000 min/mois sur
-le plan gratuit, facturé au-delà). Les vraies données (progression, fichiers
-Excel livrés aux clients) vivent volontairement dans un **second dépôt,
-privé** (`Mikajy01/walon-map-data`) — jamais dans ce dépôt-ci, pour ne
-jamais les exposer publiquement. Le workflow clone ce dépôt de données au
-début de chaque exécution (via un jeton stocké en secret GitHub Actions,
-`DATA_REPO_TOKEN`) et y pousse les résultats à la fin.
-
-Utilisation : onglet **Actions** de ce dépôt → *Traiter une commune* →
-**Run workflow**, en renseignant la commune, la limite, le débit, etc. À la
-fin (ou même si le job s'arrête avant la fin — rien n'est perdu), la base de
-progression (`cache/<commune>/http_cache.sqlite3`, cache HTTP brut vidé
-avant de committer — seule la vraie progression est conservée), le fichier
-Excel (`output/<commune>.xlsx`) et les logs sont automatiquement commités et
-poussés dans **walon-map-data** : `git pull` de ce dépôt (privé) pour les
-récupérer.
+Le workflow `.github/workflows/traiter-commune.yml` permet de lancer un
+traitement directement sur les serveurs gratuits de GitHub, sans occuper son
+propre ordinateur : onglet **Actions** du dépôt GitHub → *Traiter une
+commune* → **Run workflow**, en renseignant la commune, la limite, le débit,
+etc. À la fin (ou même si le job s'arrête avant la fin — rien n'est perdu),
+la base de progression (`cache/http_cache.sqlite3`), le fichier Excel
+(`output/<commune>.xlsx`) et les logs sont automatiquement commités et
+poussés dans le dépôt : `git pull` en local pour les récupérer.
 
 Déclenchement manuel uniquement (pas de planification automatique) — chaque
 run reprend là où le précédent s'est arrêté, exactement comme des
@@ -252,7 +258,8 @@ plutôt qu'une valeur inventée.
 ```
 main.py                    Point d'entrée CLI (orchestration, reprise) — traiter_commune() est réutilisé par gui.py
 gui.py                     Interface graphique (CustomTkinter), même logique que le CLI
-build.bat                  Construit l'exécutable portable (.exe) via PyInstaller
+build-onefile.bat          Construit l'exécutable portable (.exe) en un seul fichier via PyInstaller
+build-onedir.bat           Construit l'exécutable portable (.exe) en dossier (moins souvent bloqué par un antivirus)
 config.py                  URLs des services ArcGIS REST + règle de chaque colonne (chemins compatibles PyInstaller)
 services/
     cadastre_service.py    Découverte des rues/adresses (ICAR) + rattachement cadastral (CADMAP)

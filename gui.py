@@ -6,7 +6,7 @@ aucune logique métier n'est dupliquée ici, seulement la présentation et le
 pilotage (thread d'arrière-plan, barre de progression, journal visuel).
 
 Lancement : `python gui.py`
-Empaquetage portable : voir `build.bat` (PyInstaller --onefile).
+Empaquetage portable : voir `build-onefile.bat`/`build-onedir.bat` (PyInstaller).
 """
 
 from __future__ import annotations

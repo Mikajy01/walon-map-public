@@ -20,13 +20,14 @@ from models.rules import ColumnRule, LayerRef, RuleType
 # ---------------------------------------------------------------------------
 
 # Affichée dans l'interface (voir gui.py) et incluse dans le nom de
-# l'exécutable construit (voir build.bat) — pour qu'un utilisateur ne se
+# l'exécutable construit (voir build-onefile.bat/build-onedir.bat) — pour
+# qu'un utilisateur ne se
 # retrouve jamais à utiliser une ancienne version sans le savoir (cas réel :
 # une rue déjà marquée "redécouverte" par une ancienne version ne profite
 # d'aucun correctif ultérieur tant que l'app n'est pas mise à jour, sans
 # aucun signe visible de la version utilisée jusqu'ici). À incrémenter à
 # chaque nouvelle construction distribuée aux collaborateurs.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.5"
 
 # ---------------------------------------------------------------------------
 # Chemins

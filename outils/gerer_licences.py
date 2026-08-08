@@ -1,6 +1,7 @@
 """Outil réservé au propriétaire : génère, liste ou révoque l'accès d'une
-commune. Ne fait JAMAIS partie de l'exécutable distribué (voir build.bat —
-seul gui.py y est empaqueté ; ce dossier `outils/` n'est jamais inclus).
+commune. Ne fait JAMAIS partie de l'exécutable distribué (voir
+build-onefile.bat/build-onedir.bat — seul gui.py y est empaqueté ; ce
+dossier `outils/` n'est jamais inclus).
 
 Ce script ne modifie que la copie LOCALE `outils/autorisations.json`. Pour
 qu'un changement (nouvel accès, révocation) prenne effet côté clients, il

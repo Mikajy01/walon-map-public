@@ -9,7 +9,7 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Artefacts de build PyInstaller (voir build.bat) — régénérables, jamais versionnés
+# Artefacts de build PyInstaller (voir build-onefile.bat/build-onedir.bat) — régénérables, jamais versionnés
 build/
 dist/
 *.spec
