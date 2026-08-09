@@ -27,7 +27,7 @@ from models.rules import ColumnRule, LayerRef, RuleType
 # d'aucun correctif ultérieur tant que l'app n'est pas mise à jour, sans
 # aucun signe visible de la version utilisée jusqu'ici). À incrémenter à
 # chaque nouvelle construction distribuée aux collaborateurs.
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.3.0"
 
 # ---------------------------------------------------------------------------
 # Chemins
@@ -61,6 +61,25 @@ MAX_REQUESTS_PER_SECOND = 5.0
 HTTP_TIMEOUT_SECONDS = 30
 HTTP_MAX_ATTEMPTS = 5
 DEBUG = False  # surchargé par l'option --debug de main.py
+
+# Tolérance réduite pour des services externes moins fiables que le
+# Géoportail wallon lui-même — voir `services.geoportail_service.
+# ArcGISRestClient.query_layer`, paramètre `service_key`. Cas réel :
+# PASH (`sig.digiteaux.be`, opéré par la SPGE/Digit'Eaux, pas sur
+# geoservices.wallonie.be comme tout le reste) injoignable
+# (ConnectTimeoutError) pendant un traitement de Dour, alors que
+# Colfontaine/Chimay, tournant EN MÊME TEMPS sur des machines GitHub
+# Actions séparées, l'interrogeaient avec succès — donc pas une panne
+# généralisée mais propre à une machine/IP donnée, sans lien avec la
+# géométrie ou la commune traitée. Avec la politique par défaut (30s ×
+# 5 tentatives + délais, ~165s/requête), une telle panne coûtait jusqu'à
+# ~700s PAR PARCELLE (4 colonnes dépendant de PASH), bloquant tout le
+# reste du traitement de la commune en attendant. Une colonne concernée
+# reste "ERREUR" si le service est indisponible même avec cette
+# tolérance réduite — jamais perdue, automatiquement retentée au
+# prochain lancement (voir services/layers_service.py::retry_erreurs).
+SERVICE_TIMEOUT_SECONDS_OVERRIDES: dict[str, int] = {"PASH": 8}
+SERVICE_MAX_ATTEMPTS_OVERRIDES: dict[str, int] = {"PASH": 2}
 
 # ---------------------------------------------------------------------------
 # Services ArcGIS REST (Géoportail de Wallonie, sauf mention contraire)

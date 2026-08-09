@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 
 import requests
 
+import config
 from services.cache_service import CacheService
 from services.exceptions import ArcGISServiceError, ArcGISTransientError
 from utils.logger import get_logger
@@ -58,19 +59,35 @@ class ArcGISRestClient:
         self._session = requests.Session()
 
     @http_retry()
-    def _get_json(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _get_json(self, url: str, params: Dict[str, Any], timeout: Optional[int] = None) -> Dict[str, Any]:
+        return self._get_json_impl(url, params, timeout)
+
+    # Tolérance réduite (moins de tentatives, timeout par requête plus
+    # court) pour les services listés dans `config.SERVICE_MAX_ATTEMPTS_OVERRIDES`
+    # — voir `query_layer` plus bas pour le choix entre les deux. Même
+    # fonction `http_retry()` (déjà paramétrable en `max_attempts`,
+    # inchangée) appliquée avec une valeur différente : aucun risque pour
+    # la politique de réessai par défaut, utilisée partout ailleurs.
+    @http_retry(max_attempts=2)
+    def _get_json_tolerance_reduite(
+        self, url: str, params: Dict[str, Any], timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return self._get_json_impl(url, params, timeout)
+
+    def _get_json_impl(self, url: str, params: Dict[str, Any], timeout: Optional[int]) -> Dict[str, Any]:
         if self._use_cache:
             cached = self._cache.get(url, params)
             if cached is not None:
                 return cached
 
         self._rate_limiter.wait()
+        delai = timeout if timeout is not None else self._timeout
         if len(urlencode(params, doseq=True)) > _MAX_URL_LENGTH_BEFORE_POST:
             _logger.debug("POST %s params=%s (URL trop longue pour GET)", url, params)
-            response = self._session.post(url, data=params, timeout=self._timeout)
+            response = self._session.post(url, data=params, timeout=delai)
         else:
             _logger.debug("GET %s params=%s", url, params)
-            response = self._session.get(url, params=params, timeout=self._timeout)
+            response = self._session.get(url, params=params, timeout=delai)
         response.raise_for_status()
         data = response.json()
 
@@ -125,6 +142,7 @@ class ArcGISRestClient:
         in_sr: int = 31370,
         out_sr: int = 31370,
         order_by: Optional[str] = None,
+        service_key: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Interroge une sous-couche ArcGIS REST (`/query`) et renvoie TOUTES
         ses features, en paginant automatiquement si le service tronque la
@@ -157,7 +175,20 @@ class ArcGISRestClient:
         renvoyée en 3812 sans `outSR` explicite, coordonnées ~612000/624000
         au lieu de ~110000/120000, tout calcul de distance/tampon ensuite
         silencieusement faux).
-        """
+
+        `service_key` (ex: `"PASH"`), si fourni et listé dans
+        `config.SERVICE_MAX_ATTEMPTS_OVERRIDES`/`SERVICE_TIMEOUT_SECONDS_OVERRIDES`,
+        réduit la tolérance aux pannes pour CE service précis (moins de
+        tentatives, timeout par requête plus court) — pensé pour les
+        services externes moins fiables que le Géoportail wallon lui-même
+        (ex: PASH/`sig.digiteaux.be`, opéré par la SPGE/Digit'Eaux, pas sur
+        `geoservices.wallonie.be`) : cas réel constaté, service injoignable
+        pendant le traitement de Dour (`ConnectTimeoutError`), jusqu'à
+        ~165s perdues par requête avec la politique de réessai par défaut
+        (30s × 5 tentatives + délais), 4 colonnes dépendant de PASH par
+        parcelle — jusqu'à ~700s/parcelle, bloquant tout le reste du
+        traitement de la commune. Sans effet sur les services non listés
+        (comportement par défaut inchangé, utilisé pour tout le reste)."""
         url = f"{service_url}/{layer_id}/query"
         base_params: Dict[str, Any] = {
             "f": "json",
@@ -178,6 +209,16 @@ class ArcGISRestClient:
                 }
             )
 
+        # Tolérance réduite pour un service listé dans les overrides (voir
+        # docstring `service_key` ci-dessus) — choisie une seule fois par
+        # appel, pas par page.
+        timeout_reduit = config.SERVICE_TIMEOUT_SECONDS_OVERRIDES.get(service_key) if service_key else None
+        get_json = (
+            self._get_json_tolerance_reduite
+            if service_key in config.SERVICE_MAX_ATTEMPTS_OVERRIDES
+            else self._get_json
+        )
+
         all_features: List[Dict[str, Any]] = []
         offset = 0
         nb_pages = 0
@@ -191,7 +232,7 @@ class ArcGISRestClient:
             # lorsqu'il est réellement nécessaire (page 2+) évite ce rejet
             # sans rien perdre côté pagination réelle (ICAR_ADR_PT, etc.).
             params = dict(base_params, resultOffset=offset) if offset else dict(base_params)
-            data = self._get_json(url, params)
+            data = get_json(url, params, timeout=timeout_reduit)
             features = data.get("features", [])
             all_features.extend(features)
             if not data.get("exceededTransferLimit") or not features:

@@ -213,6 +213,7 @@ class LayersService:
             layer_id=layer.layer_id,
             geometry=parcelle.geometry,
             out_fields=out_fields,
+            service_key=layer.service,
         )
 
     def _resolve_layer_presence(self, rule: ColumnRule, parcelle: Parcelle) -> str:
