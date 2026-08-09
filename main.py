@@ -663,14 +663,29 @@ def traiter_commune(
     # au moins une parcelle résolue avant ou pendant cette exécution) qui
     # ne sont malgré tout pas encore complètes — gratuit, aucun appel
     # réseau supplémentaire, à partir des données déjà collectées
-    # ci-dessus. Avec l'ordre strict imposé par `_traiter_jusqu_a_objectif`,
-    # ce cas ne devrait plus survenir qu'en présence d'échecs (une rue
-    # s'arrête au milieu) ou tant que des rues plus anciennes n'ont pas
-    # encore été rattrapées au rayon élargi (voir plus haut) — sert de
-    # signal explicite pour le suivi manuel plutôt que de laisser deviner.
+    # ci-dessus. Sert de signal explicite pour le suivi manuel plutôt que
+    # de laisser deviner.
+    #
+    # `p.valeurs.get("D", p.rue)` pour déterminer si une rue est déjà
+    # commencée — JAMAIS `p.rue` seul (la rue la plus proche recalculée à
+    # CETTE exécution, voir CadastreService.rue_la_plus_proche) : pour une
+    # parcelle sans adresse déjà résolue, ce recalcul peut légèrement
+    # différer d'une exécution à l'autre pour une parcelle proche de la
+    # frontière entre deux rues, sans jamais réécrire la colonne D déjà
+    # enregistrée (immuable une fois une parcelle résolue — voir
+    # `_set_identification_columns`, appelée une seule fois, jamais pour
+    # une parcelle déjà connue). Cas réel constaté : des parcelles
+    # enregistrées sous "Beaurieux" recalculées "les plus proches" de "Rue
+    # Sainte-Monégonde" à une exécution suivante — utiliser `p.rue` seul
+    # faisait croire à tort que Sainte-Monégonde était "commencée", alors
+    # qu'aucune de ses propres parcelles n'a jamais été résolue (le fichier
+    # de sortie, lui, n'a jamais été affecté — seul ce rapport se trompait).
     nouvellement_traitees_ids = {p.identifiant for p in nouvellement_traitees}
     encore_a_faire = [p for p in a_faire if p.identifiant not in nouvellement_traitees_ids]
-    rues_commencees = {p.rue for p in deja_faites} | {p.rue for p in nouvellement_traitees}
+    rues_commencees = (
+        {p.valeurs.get("D", p.rue) for p in deja_faites}
+        | {p.valeurs.get("D", p.rue) for p in nouvellement_traitees}
+    )
     parcelles_manquantes_par_rue: Dict[str, int] = {}
     for p in encore_a_faire:
         if p.rue in rues_commencees:
